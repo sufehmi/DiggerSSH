@@ -117,19 +117,34 @@ SSH_BIN="$(command -v ssh 2>/dev/null || echo ssh)"
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
 # ============================================================ forwarding =====
+# The forward spec as it appears in an ssh command line. The bind address is
+# optional: ssh accepts "-L port:host:port" and "-L [::1]:port:host:port" as
+# equivalent, and the second form is used when one loopback family is
+# already taken. A matcher that only knows the first form would report a
+# running tunnel as stopped, and a later start would then collide with it.
 forward_spec() {
     local dir="$1" sport="$2" dport="$3"
     printf -- '-%s %s:%s:%s' "$dir" "$sport" "$TARGET_HOST" "$dport"
 }
 
+# The set of specs that identify a tunnel in an ssh command line: the plain
+# form and the bind-address forms.
+forward_specs() {
+    local dir="$1" sport="$2" dport="$3"
+    printf -- '-%s %s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+    printf -- '-%s 127.0.0.1:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+    printf -- '-%s [::1]:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+    printf -- '-%s [::]:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+    printf -- '-%s 0.0.0.0:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+}
+
 tunnel_pid() {
     local sport="$1" dport="$2" dir="${3:-}"
-    local specs=()
+    local -a specs=()
     if [[ -n "$dir" ]]; then
-        specs+=("$(forward_spec "$dir" "$sport" "$dport")")
+        mapfile -t specs < <(forward_specs "$dir" "$sport" "$dport")
     else
-        specs+=("$(forward_spec L "$sport" "$dport")")
-        specs+=("$(forward_spec R "$sport" "$dport")")
+        mapfile -t specs < <(forward_specs L "$sport" "$dport"; forward_specs R "$sport" "$dport")
     fi
     local pid cmd spec
     for pid in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
@@ -419,8 +434,28 @@ open_tunnel() {
             ok "Tunnel started (pid $pid) — $host:$sport → local:$TARGET_HOST:$dport"
         fi
     else
-        err "Tunnel did not come up. Log:"
-        [[ -f "$TUNNEL_DIR/$slug.log" ]] && sed 's/^/    /' "$TUNNEL_DIR/$slug.log"
+        # A bind failure means the port is already taken. Say so plainly and
+        # name the holder, rather than leaving the raw ssh error to explain.
+        local log; log="$(cat "$TUNNEL_DIR/$slug.log" 2>/dev/null)"
+        if printf '%s' "$log" | grep -qi "address already in use"; then
+            err "Port $sport is already in use — the tunnel could not bind."
+            local holder; holder="$(socket_owner_pids "$sport" | head -1)"
+            if [[ -n "$holder" ]]; then
+                local hcomm; hcomm="$(cat "/proc/$holder/comm" 2>/dev/null)"
+                err "  held by $hcomm (pid $holder)"
+                if [[ "$hcomm" == "ssh" || "$hcomm" == "autossh" ]]; then
+                    err "  that looks like a tunnel DiggerSSH did not recognise —"
+                    err "  try 'Stop a tunnel', or stop it manually: kill $holder"
+                else
+                    err "  it is not an ssh tunnel — free the port and retry."
+                fi
+            else
+                err "  the holder is not a local process (it may be bound on the server)."
+            fi
+        else
+            err "Tunnel did not come up. Log:"
+            [[ -n "$log" ]] && printf '%s\n' "$log" | sed 's/^/    /'
+        fi
         return 1
     fi
 }
@@ -440,7 +475,7 @@ stop_tunnel() {
     fi
     sleep 1
     local p cmd spec
-    for spec in "$(forward_spec L "$sport" "$dport")" "$(forward_spec R "$sport" "$dport")"; do
+    for spec in $(forward_specs L "$sport" "$dport"; forward_specs R "$sport" "$dport"); do
         for p in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
             [[ -r "/proc/$p/cmdline" ]] || continue
             cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
