@@ -1000,6 +1000,10 @@ connect_tunnel() {
     return 1
   done
 
+  if (( choice < 1 )); then
+    err "Tunnel numbers start at 1."
+    return 1
+  fi
   err "Tunnel #$choice not found."
   return 1
 }
