@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.3.5 — SSH Tunnel Manager
+#  DiggerSSH v1.3.6 — SSH Tunnel Manager
 #
-#  Each tunnel is recorded with the PID of the process that holds it, so
-#  status checks and "Stop" act on a known process rather than pattern-
-#  matching the process table (which can match the tool's own shell).
+#  Flat main menu; each action returns here and the menu re-renders with
+#  refreshed status:
+#
+#    1) Create Tunnel to Server          — the provisioning form
+#    2) Connect Tunnel (to a server's Port)
+#    3) List tunnels                   — prints the table, returns here
+#    4) Stop a tunnel                  — asks which, kills it, returns here
+#    0) Exit
 #
 #  State layout:
-#    ~/.diggerssh/config           defaults (LAST_HOST, LAST_USER, …)
-#    ~/.diggerssh/tunnels/<id>.tunnel   tunnel record
-#    ~/.diggerssh/tunnels/<id>.pid      PID of the live tunnel process
+#    ~/.diggerssh/config                 defaults (LAST_HOST, LAST_USER, …)
+#    ~/.diggerssh/tunnels/<id>.tunnel    the tunnel record
+#    ~/.diggerssh/tunnels/<id>.pid       PID of the live tunnel process
 #
 #  The -L target host is fixed at 127.0.0.1: the tunnel terminates on the
 #  server, so its destination is whatever listens on that server's loopback.
 # ============================================================================
 
 set -o pipefail
-VERSION="1.3.5"
+VERSION="1.3.6"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -71,54 +76,33 @@ fi
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
 # A tunnel counts as running only when its recorded PID is alive AND the port
-# is bound. Pattern-matching the process table alone is unreliable: it can
-# match the shell hosting this script.
+# is bound. Pattern-matching the process table is unreliable — it can match
+# the shell hosting this script.
+port_bound() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}\$"; }
+
 status_of() {
-    local sport="$1" pidfile="$TUNNEL_DIR/$2.pid"
-    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null \
-       && ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${sport}\$"; then
-        printf '%s' "running"
+    local slug="$1" pidfile="$TUNNEL_DIR/$slug.pid"
+    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+        printf '%srunning%s' "$C_GREEN" "$C_RESET"
     else
-        printf '%s' "stopped"
+        printf '%sstopped%s' "$C_YELLOW" "$C_RESET"
     fi
 }
 
-print_banner() {
-    printf '\n'
-    printf '%s%s    ____  _                       __________ __  __%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s   / __ \\(_)___ _____ ____  _____/ ___/ ___// / / /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s  / / / / / __ `/ __ `/ _ \\/ ___/\\__ \\__ \\/ /_/ /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s / /_/ / / /_/ /  __/ /   ___/ /__/ / __ /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s/_____/_/\\__, /\\__, /\\___/_/   /____/____/_/ /_/%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s        /____//____/%s\n' "$C_CYAN" "$C_RESET"
-    printf '%s   v%s  SSH tunnel manager%s\n' "$C_CYAN" "$VERSION" "$C_RESET"
-    printf '\n'
-}
-
-init_state() {
-    mkdir -p "$DIGGERSH_HOME" "$TUNNEL_DIR" 2>/dev/null || true
-    chmod 700 "$DIGGERSH_HOME" 2>/dev/null || true
-    [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
-    [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE"
-}
-
 # ============================================================ records ========
-# One file per tunnel: <host>_<port>.tunnel holding KEY=value pairs.
-record_path() { printf '%s/%s.tunnel' "$TUNNEL_DIR" "$(slug_of "$1" "$2")"; }
-slug_of()    { printf '%s_%s' "${1//[^a-zA-Z0-9._-]/_}" "$2"; }
+slug_of() { printf '%s_%s' "${1//[^a-zA-Z0-9._-]/_}" "$2"; }
 
 list_records() {
     local f
     for f in "$TUNNEL_DIR"/*.tunnel; do
         [[ -f "$f" ]] || continue
-        local host user sport dport params status
+        local slug host user sport dport
+        slug="$(basename "$f" .tunnel)"
         host="$(grep -m1 '^HOST='          "$f" | cut -d'=' -f2-)"
         user="$(grep -m1 '^USER='         "$f" | cut -d'=' -f2-)"
         sport="$(grep -m1 '^SOURCE_PORT=' "$f" | cut -d'=' -f2-)"
         dport="$(grep -m1 '^DEST_PORT='   "$f" | cut -d'=' -f2-)"
-        params="$(grep -m1 '^SSH_PARAMS=' "$f" | cut -d'=' -f2-)"
-        status="$(status_of "$sport" "$(basename "$f" .tunnel)")"
-        printf '%s|%s|%s|%s|%s|%s\n' "$(basename "$f" .tunnel)" "$host" "$user" "$sport" "$dport" "$status"
+        printf '%s|%s|%s|%s|%s\n' "$slug" "$host" "$user" "$sport" "$dport"
     done | sort
 }
 
@@ -137,69 +121,65 @@ save_record() {
     chmod 600 "$TUNNEL_DIR/$slug.tunnel" 2>/dev/null || true
 }
 
-# ============================================================ submenu ========
-submenu() {
-    local title="$1" action="$2"
-    while true; do
-        print_banner
-        printf '%s── %s ──%s\n' "$C_BOLD" "$title" "$C_RESET"
-        local out; out="$(list_records)"
-        local n=0 line slug host user sport dport status
-        if [[ -n "$out" ]]; then
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                n=$((n + 1))
-                IFS='|' read -r slug host user sport dport status <<< "$line"
-                printf '  %s%2d%s) %s:%s → %s:%s  %s%s%s\n' \
-                    "$C_BOLD" "$n" "$C_RESET" "$host" "$sport" "$TARGET_HOST" "$dport" "$status" "" "$C_RESET"
-            done <<< "$out"
-        fi
-        local add=$((n + 1))
-        printf '  %s%2d%s) %s+ Add new server%s\n' "$C_CYAN" "$add" "$C_RESET" "$C_DIM" "$C_RESET"
-        printf '  %s%2d%s) %sExit to main menu%s\n\n' "$C_RED" "0" "$C_RESET" "$C_DIM" "$C_RESET"
-
-        ask "Select" "1"
-        [[ "$EOF_REACHED" == "1" ]] && { echo; return 0; }
-        if [[ "$REPLY" == "0" ]]; then return 0; fi
-        if [[ "$REPLY" == "$add" ]]; then "$action" "__new__"; return 0; fi
-        if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= n )); then
-            "$action" "$REPLY"
-            return 0
-        fi
-        err "Invalid selection."
-    done
+# ============================================================ rendering ======
+render_table() {
+    local out; out="$(list_records)"
+    printf '\n%s── %s ──%s\n' "$C_BOLD" "$1" "$C_RESET"
+    if [[ -z "$out" ]]; then info "No tunnels registered yet."; return 0; fi
+    printf '  %-4s %-16s %-10s %-10s %s\n' "#" "HOST" "SOURCE" "DEST" "STATUS"
+    printf '  %-4s %-16s %-10s %-10s %s\n' "---" "----" "------" "----" "------"
+    local n=0 line slug host user sport dport
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        n=$((n + 1))
+        IFS='|' read -r slug host user sport dport <<< "$line"
+        printf '  %-4s %-16s %-10s %-10s %s\n' "$n" "$host" "$sport" "$dport" "$(status_of "$slug")"
+    done <<< "$out"
 }
 
 # ============================================================ actions =========
-act_create() {
-    if [[ "$1" == "__new__" ]]; then provisioning_form; return; fi
-    local out; out="$(list_records)"
-    local rec; rec="$(printf '%s\n' "$out" | sed -n "${1}p")"
-    local slug host user sport dport
-    IFS='|' read -r slug host user sport dport _ <<< "$rec"
-    open_tunnel "$host" "$user" "$sport" "$dport" ""
+# Create / Connect: show the table, ask which, act.
+# List: show the table and return.
+# Stop: show the table, ask which, kill it.
+
+do_create() {
+    render_table "Create Tunnel to Server — choose a tunnel, or add a new server"
+    printf '  %-4s %s\n' "+ Add new server" ""
+    ask "Select" "1"
+    [[ "$EOF_REACHED" == "1" ]] && return 0
+    provisioning_form
 }
 
-act_connect() { act_create "$@"; }
-act_list()    { if [[ "$1" == "__new__" ]]; then provisioning_form; fi; }
+do_connect() {
+    render_table "Connect Tunnel (to a server's Port)"
+    printf '  %-4s %s\n' "+ Add new server" ""
+    ask "Select" "1"
+    [[ "$EOF_REACHED" == "1" ]] && return 0
+    provisioning_form
+}
 
-act_stop() {
-    if [[ "$1" == "__new__" ]]; then provisioning_form; return; fi
-    local out; out="$(list_records)"
-    local rec; rec="$(printf '%s\n' "$out" | sed -n "${1}p")"
+do_list() {
+    render_table "List tunnels"
+    printf '\n'
+    return 0
+}
+
+do_stop() {
+    render_table "Stop a tunnel"
+    printf '\n'
+    local total; total="$(list_records | grep -c .)"
+    if (( total == 0 )); then return 0; fi
+    ask "Select tunnel to stop" "1"
+    [[ "$EOF_REACHED" == "1" ]] && return 0
+    [[ "$REPLY" == "0" ]] && return 0
+    if ! [[ "$REPLY" =~ ^[0-9]+$ ]] || (( REPLY < 1 || REPLY > total )); then err "Invalid selection."; return 0; fi
+    local rec; rec="$(list_records | sed -n "${REPLY}p")"
     local slug host user sport dport
-    IFS='|' read -r slug host user sport dport _ <<< "$rec"
+    IFS='|' read -r slug host user sport dport <<< "$rec"
     local pidfile="$TUNNEL_DIR/$slug.pid"
-    if [[ ! -f "$pidfile" ]]; then
-        warn "Tunnel $slug has no recorded PID — it was not started by this tool."
-        return 0
-    fi
+    if [[ ! -f "$pidfile" ]]; then warn "Tunnel $slug has no recorded PID — start it first."; return 0; fi
     local pid; pid="$(cat "$pidfile")"
-    if ! kill -0 "$pid" 2>/dev/null; then
-        warn "Recorded process $pid is no longer alive."
-        rm -f "$pidfile"
-        return 0
-    fi
+    if ! kill -0 "$pid" 2>/dev/null; then warn "Recorded process $pid is no longer alive."; rm -f "$pidfile"; return 0; fi
     kill "$pid" 2>/dev/null || true
     sleep 1
     kill -9 "$pid" 2>/dev/null || true
@@ -226,65 +206,79 @@ provisioning_form() {
     ask "Destination Port (on the server)" "$sport"; local dport="$REPLY"
     ask "SSH parameters" "$DEFAULT_SSH_PARAMS"; local params="$REPLY"
 
-    for p in "$sshport" "$sport" "$dport"; do
+    for p in "$sport" "$dport"; do
         if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then err "Invalid port: $p"; return 1; fi
     done
     [[ -n "$host" ]] || { err "Host is required."; return 1; }
 
     printf '\n%sStep 3 — Review%s\n' "$C_BOLD" "$C_RESET"
-    printf '  ssh -p %s %s -L %s:%s:%s %s@%s\n' "$sport" "$params" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
+    printf '  ssh -p %s %s -L %s:%s:%s %s@%s\n' "$sshport" "$params" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
     ask "Save? [y/N]" "y"
     [[ "$EOF_REACHED" == "1" ]] && return 1
     [[ "${REPLY,,}" == "y" ]] || { warn "Cancelled."; return 1; }
 
     cfg_set LAST_HOST "$host"
     cfg_set LAST_USER "$user"
-    cfg_set LAST_SSH_PORT "$sport"
+    cfg_set LAST_SSH_PORT "$sshport"
     cfg_set LAST_SOURCE_PORT "$sport"
     cfg_set LAST_DEST_PORT "$dport"
     save_record "$host" "$user" "$sport" "$dport" "$params"
-    ok "Tunnel saved."
-    open_tunnel "$host" "$user" "$sport" "$dport" "$params"
+    start_process "$host" "$user" "$sport" "$dport" "$params"
 }
 
-open_tunnel() {
+start_process() {
     local host="$1" user="$2" sport="$3" dport="$4" params="${5:-$DEFAULT_SSH_PARAMS}"
     local slug; slug="$(slug_of "$host" "$sport")"
-    local pidfile="$TUNNEL_DIR/$slug.pid"
-    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-        ok "Tunnel $slug is already running (pid $(cat "$pidfile"))."
-        return 0
-    fi
+    if port_bound "$sport"; then ok "Port $sport is already bound — nothing to do."; return 0; fi
     # shellcheck disable=SC2086
     nohup "$TRANSPORT" -N -f $params \
         -o StrictHostKeyChecking=accept-new \
         -L "${sport}:${TARGET_HOST}:${dport}" "$user@$host" > "$TUNNEL_DIR/$slug.log" 2>&1 < /dev/null &
     local pid=$!
     sleep 1
-    printf '%s\n' "$pid" > "$pidfile"
+    printf '%s\n' "$pid" > "$TUNNEL_DIR/$slug.pid"
     ok "Tunnel started (pid $pid) — localhost:$sport → $TARGET_HOST:$dport"
 }
 
 # ------------------------------------------------------------------ menu ----
 main_menu() {
     while true; do
-        print_banner
-        printf '  %s1%s) Create Tunnel to Server\n'              "$C_GREEN" "$C_RESET"
-        printf '  %s2%s) Connect Tunnel (to a server'"'"'s Port)\n' "$C_GREEN" "$C_RESET"
-        printf '  %s3%s) List tunnels\n'                       "$C_GREEN" "$C_RESET"
-        printf '  %s4%s) Stop a tunnel\n'                     "$C_YELLOW" "$C_RESET"
-        printf '  %s0%s) Exit\n\n'                            "$C_RED"   "$C_RESET"
+        printf '\n'
+        print_banner_body
         ask "Choose an option" "1"
         [[ "$EOF_REACHED" == "1" ]] && { info "End of input — exiting."; exit 0; }
         case "$REPLY" in
-            1) submenu "Create Tunnel to Server" act_create ;;
-            2) submenu "Connect Tunnel (to a server's Port)" act_connect ;;
-            3) submenu "List tunnels" act_list ;;
-            4) submenu "Stop a tunnel" act_stop ;;
+            1) do_create ;;
+            2) do_connect ;;
+            3) do_list ;;
+            4) do_stop ;;
             0) info "Bye."; exit 0 ;;
             *) err "Unknown option." ;;
         esac
     done
+}
+
+print_banner_body() {
+    printf '%s%s    ____  _                       __________ __  __%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s   / __ \\(_)___ _____ ____  _____/ ___/ ___// / / /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s  / / / / / __ `/ __ `/ _ \\/ ___/\\__ \\__ \\/ /_/ /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s / /_/ / / /_/ / /_/ /  __/ /   ___/ /__/ / __ /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s/_____/_/\\__, /\\__, /\\___/_/   /____/____/_/ /_/%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s        /____//____/%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s   v%s  SSH tunnel manager%s\n' "$C_CYAN" "$VERSION" "$C_RESET"
+    printf '\n'
+    printf '  %s1%s) Create Tunnel to Server\n'           "$C_GREEN" "$C_RESET"
+    printf '  %s2%s) Connect Tunnel (to a server'"'"'s Port)\n' "$C_GREEN" "$C_RESET"
+    printf '  %s3%s) List tunnels\n'                   "$C_GREEN" "$C_RESET"
+    printf '  %s4%s) Stop a tunnel\n'                 "$C_YELLOW" "$C_RESET"
+    printf '  %s0%s) Exit\n'                         "$C_RED"   "$C_RESET"
+}
+
+init_state() {
+    mkdir -p "$DIGGERSH_HOME" "$TUNNEL_DIR" 2>/dev/null || true
+    chmod 700 "$DIGGERSH_HOME" 2>/dev/null || true
+    [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
+    [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE"
 }
 
 init_state
