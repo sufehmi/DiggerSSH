@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.4.0 — SSH Tunnel Manager
+#  DiggerSSH v1.4.1 — SSH Tunnel Manager
 #
 #  Main menu
 #    1) Create Tunnel to Server
@@ -18,6 +18,14 @@
 #  single source of truth for both status and stopping, so the three views
 #  can never disagree.
 #
+#  Address families
+#  ----------------
+#  A port can be free on one loopback family and taken on the other. "Is
+#  port N in use" is therefore answered per family, and a tunnel is bound
+#  when ssh holds it on EITHER family. Refusing to start because the IPv4
+#  side is occupied by an unrelated process would block a tunnel that can
+#  perfectly well bind [::1].
+#
 #  State layout
 #    ~/.diggerssh/config                 defaults (LAST_HOST, LAST_USER, …)
 #    ~/.diggerssh/tunnels/<id>.tunnel    the tunnel record
@@ -28,7 +36,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -83,18 +91,8 @@ fi
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
 # ============================================================ ownership =======
-# The PID that holds the listening socket on $1, according to the kernel.
-# This is the only authority on whether a tunnel is running: a recorded PID
-# can be a dead autossh supervisor, and the port may also be held by an
-# unrelated process.
-socket_owner_pid() {
-    local port="$1"
-    ss -ltnp 2>/dev/null \
-      | awk -v p="$port" '$4 ~ (":" p "$")' \
-      | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
-}
-
-# All PIDs holding a socket on $1 (both the IPv4 and IPv6 listener).
+# PIDs holding a listening socket on $1, per address. ss prints the local
+# address in column 4, e.g. "127.0.0.1:44641" or "[::1]:44641".
 socket_owner_pids() {
     local port="$1"
     ss -ltnp 2>/dev/null \
@@ -102,22 +100,46 @@ socket_owner_pids() {
       | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
 }
 
-# The tunnel is running when a live ssh/autossh process holds its port.
+# The PID of the ssh/autossh process holding this port, if any. Other
+# processes (an unrelated daemon, say) do not count: they are not tunnels.
 tunnel_pid() {
-    local port="$1" pid
+    local port="$1" pid comm
     for pid in $(socket_owner_pids "$port"); do
-        [[ -n "$pid" ]] || continue
-        if [[ -r "/proc/$pid/cmdline" ]]; then
-            local comm; comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-            case "$comm" in
-                ssh|autossh) printf '%s' "$pid"; return 0 ;;
-            esac
-        fi
+        [[ -n "$pid" && -r "/proc/$pid/comm" ]] || continue
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+        case "$comm" in
+            ssh|autossh) printf '%s' "$pid"; return 0 ;;
+        esac
     done
     return 1
 }
 
-port_bound() { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}\$"; }
+# The address family a listener on $1 uses: "ipv4", "ipv6", or "" if free.
+# A port may be free on one family and busy on the other, so this is asked
+# per family rather than as a single "is it in use" question.
+family_in_use() {
+    local port="$1" family="$2" addr
+    case "$family" in
+        ipv4) addr="127.0.0.1:${port}" ;;
+        ipv6) addr="[::1]:${port}" ;;
+        *) return 1 ;;
+    esac
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$addr"
+}
+
+# True when the port is taken on both loopback families.
+port_fully_taken() {
+    family_in_use "$1" ipv4 && family_in_use "$1" ipv6
+}
+
+status_text() {
+    local port="$1"
+    if tunnel_pid "$port" >/dev/null 2>&1; then
+        printf '%srunning%s' "$C_GREEN" "$C_RESET"
+    else
+        printf '%sstopped%s' "$C_YELLOW" "$C_RESET"
+    fi
+}
 
 # ============================================================ records ========
 slug_of() { printf '%s_%s' "${1//[^a-zA-Z0-9._-]/_}" "$2"; }
@@ -149,15 +171,6 @@ save_record() {
         printf 'CREATED=%q\n'      "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$TUNNEL_DIR/$slug.tunnel"
     chmod 600 "$TUNNEL_DIR/$slug.tunnel" 2>/dev/null || true
-}
-
-status_text() {
-    local port="$1"
-    if tunnel_pid "$port" >/dev/null 2>&1; then
-        printf '%srunning%s' "$C_GREEN" "$C_RESET"
-    else
-        printf '%sstopped%s' "$C_YELLOW" "$C_RESET"
-    fi
 }
 
 # ============================================================ submenu ========
@@ -210,17 +223,31 @@ open_tunnel() {
         ok "Tunnel $slug is already running (pid $pid)."
         return 0
     fi
-    # Port held by something that is not our tunnel.
-    if port_bound "$sport"; then
-        local other; other="$(socket_owner_pid "$sport")"
-        warn "Port $sport is held by another process (pid ${other:-unknown}) — not a DiggerSSH tunnel."
+
+    # Blocked only when BOTH loopback families are taken. One free family is
+    # enough for ssh to bind.
+    if port_fully_taken "$sport"; then
+        local other; other="$(socket_owner_pids "$sport" | head -1)"
+        warn "Port $sport is held on both IPv4 and IPv6 by another process (pid ${other:-unknown})."
         return 1
+    fi
+    # ssh binds BOTH loopback families for -L and aborts if either fails, so
+    # bind the free family explicitly.
+    local bindaddr
+    if family_in_use "$sport" ipv4; then
+        bindaddr="[::1]"
+        warn "127.0.0.1:$sport is held by another process — binding [::1]:$sport instead."
+    elif family_in_use "$sport" ipv6; then
+        bindaddr="127.0.0.1"
+        warn "[::1]:$sport is held by another process — binding 127.0.0.1:$sport instead."
+    else
+        bindaddr=""     # both free — let ssh pick
     fi
 
     # shellcheck disable=SC2086
     nohup "$TRANSPORT" -N $params \
         -o StrictHostKeyChecking=accept-new \
-        -L "${sport}:${TARGET_HOST}:${dport}" "$user@$host" \
+        -L "${bindaddr:+$bindaddr:}${sport}:${TARGET_HOST}:${dport}" "$user@$host" \
         > "$TUNNEL_DIR/$slug.log" 2>&1 < /dev/null &
     sleep 2
 
