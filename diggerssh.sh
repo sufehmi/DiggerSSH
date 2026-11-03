@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.4.1 — SSH Tunnel Manager
+#  DiggerSSH v1.5.1 — SSH Tunnel Manager
+#
+#  Forwarding direction
+#  --------------------
+#  The two tunnel menus use different directions:
+#
+#    1) Create Tunnel to Server        →  -R  (remote forward)
+#         The SERVER listens on the port. Traffic arriving there is carried
+#         down the SSH connection and delivered to 127.0.0.1:<dest> here.
+#
+#           ssh -p <port> <params> -R <sport>:127.0.0.1:<dest> user@host
+#
+#    2) Connect Tunnel (to a server's Port)  →  -L  (local forward)
+#         THIS machine listens on the port and forwards into the server's
+#         port. The local port matches the port the tunnel uses on the
+#         server, so both ends use the same number.
+#
+#           ssh -p <port> <params> -L <sport>:127.0.0.1:<dest> user@host
 #
 #  Main menu
 #    1) Create Tunnel to Server
@@ -9,34 +26,25 @@
 #    4) Stop a tunnel
 #    0) Exit
 #
-#  Process ownership
-#  ------------------
-#  autossh forks a child ssh, and with -f the supervisor exits at once, so a
-#  PID captured from $! is either the wrong process or already dead. Instead
-#  of trusting a recorded PID, the tunnel's owner is discovered from the
-#  kernel: ss -ltnp names the PID holding the listening socket. That is the
-#  single source of truth for both status and stopping, so the three views
-#  can never disagree.
-#
-#  Address families
-#  ----------------
-#  A port can be free on one loopback family and taken on the other. "Is
-#  port N in use" is therefore answered per family, and a tunnel is bound
-#  when ssh holds it on EITHER family. Refusing to start because the IPv4
-#  side is occupied by an unrelated process would block a tunnel that can
-#  perfectly well bind [::1].
+#  Ownership
+#  ---------
+#  A -R tunnel's listener is on the server, so the local socket table says
+#  nothing about it. Ownership is therefore determined by the local ssh
+#  process that carries the forward argument: that process IS the tunnel. It
+#  is located by matching the exact -L/-R argument in /proc, never with a
+#  broad pkill -f, which can match this script's own shell.
 #
 #  State layout
 #    ~/.diggerssh/config                 defaults (LAST_HOST, LAST_USER, …)
 #    ~/.diggerssh/tunnels/<id>.tunnel    the tunnel record
 #    ~/.diggerssh/tunnels/<id>.log       the tunnel's output
 #
-#  The -L target host is fixed at 127.0.0.1: the tunnel terminates on the
-#  server, so its destination is whatever listens on that server's loopback.
+#  The forward target host is fixed at 127.0.0.1 on the far side.
 # ============================================================================
 
+
 set -o pipefail
-VERSION="1.4.1"
+VERSION="1.5.1"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -90,9 +98,15 @@ if [[ -z "${DIGGERSH_NO_OQS:-}" ]]; then
 fi
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
-# ============================================================ ownership =======
-# PIDs holding a listening socket on $1, per address. ss prints the local
-# address in column 4, e.g. "127.0.0.1:44641" or "[::1]:44641".
+# ============================================================ forwards =======
+# The exact argument that identifies a tunnel in an ssh command line.
+forward_spec() {
+    local dir="$1" sport="$2" dport="$3"
+    printf -- '-%s %s:%s:%s' "$dir" "$sport" "$TARGET_HOST" "$dport"
+}
+
+# PIDs holding a listening socket on $1. ss prints the local address in
+# column 4, e.g. "127.0.0.1:44641" or "[::1]:44641".
 socket_owner_pids() {
     local port="$1"
     ss -ltnp 2>/dev/null \
@@ -100,23 +114,9 @@ socket_owner_pids() {
       | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
 }
 
-# The PID of the ssh/autossh process holding this port, if any. Other
-# processes (an unrelated daemon, say) do not count: they are not tunnels.
-tunnel_pid() {
-    local port="$1" pid comm
-    for pid in $(socket_owner_pids "$port"); do
-        [[ -n "$pid" && -r "/proc/$pid/comm" ]] || continue
-        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-        case "$comm" in
-            ssh|autossh) printf '%s' "$pid"; return 0 ;;
-        esac
-    done
-    return 1
-}
-
-# The address family a listener on $1 uses: "ipv4", "ipv6", or "" if free.
-# A port may be free on one family and busy on the other, so this is asked
-# per family rather than as a single "is it in use" question.
+# Whether a listener on $1 exists in the given address family. A port can be
+# free on one loopback family and busy on the other, so this is asked per
+# family rather than as a single "is it in use" question.
 family_in_use() {
     local port="$1" family="$2" addr
     case "$family" in
@@ -127,15 +127,42 @@ family_in_use() {
     ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$addr"
 }
 
-# True when the port is taken on both loopback families.
-port_fully_taken() {
-    family_in_use "$1" ipv4 && family_in_use "$1" ipv6
+# The PID of the ssh/autossh process carrying this forward, in either
+# direction. $2 optionally restricts the search to one direction.
+tunnel_pid() {
+    local sport="$1" dport="$2" dir="${3:-}"
+    local specs=()
+    if [[ -n "$dir" ]]; then
+        specs+=("$(forward_spec "$dir" "$sport" "$dport")")
+    else
+        specs+=("$(forward_spec L "$sport" "$dport")")
+        specs+=("$(forward_spec R "$sport" "$dport")")
+    fi
+    local pid cmd spec
+    for pid in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
+        [[ "$pid" == "$$" ]] && continue
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+        for spec in "${specs[@]}"; do
+            [[ "$cmd" == *"$spec"* ]] && { printf '%s' "$pid"; return 0; }
+        done
+    done
+    return 1
+}
+
+# The direction a running tunnel uses, for display: "L", "R", or "".
+tunnel_dir() {
+    local sport="$1" dport="$2" dir
+    for dir in L R; do
+        if tunnel_pid "$sport" "$dport" "$dir" >/dev/null 2>&1; then printf '%s' "$dir"; return 0; fi
+    done
+    return 1
 }
 
 status_text() {
-    local port="$1"
-    if tunnel_pid "$port" >/dev/null 2>&1; then
-        printf '%srunning%s' "$C_GREEN" "$C_RESET"
+    local sport="$1" dport="$2" dir
+    if dir="$(tunnel_dir "$sport" "$dport")"; then
+        printf '%srunning%s%s' "$C_GREEN" "$C_RESET" "$C_DIM(-$dir)$C_RESET"
     else
         printf '%sstopped%s' "$C_YELLOW" "$C_RESET"
     fi
@@ -174,8 +201,9 @@ save_record() {
 }
 
 # ============================================================ submenu ========
+# mode: open-R (create) | open-L (connect) | stop
 submenu() {
-    local title="$1" mode="$2"     # mode: open | stop
+    local title="$1" mode="$2"
     local out; out="$(list_records)"
     local total; total="$(printf '%s\n' "$out" | grep -c . || true)"
 
@@ -186,7 +214,7 @@ submenu() {
         n=$((n + 1))
         IFS='|' read -r slug host user sport dport <<< "$line"
         printf '  %s%2d%s) %s:%s → %s:%s  %s\n' \
-            "$C_BOLD" "$n" "$C_RESET" "$host" "$sport" "$TARGET_HOST" "$dport" "$(status_text "$sport")"
+            "$C_BOLD" "$n" "$C_RESET" "$host" "$sport" "$TARGET_HOST" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
 
     local add=$((n + 1))
@@ -196,16 +224,24 @@ submenu() {
     ask "Select" "1"
     [[ "$EOF_REACHED" == "1" ]] && return 0
     if [[ "$REPLY" == "0" ]]; then return 0; fi
-    if [[ "$REPLY" == "$add" ]]; then provisioning_form; return 0; fi
+    if [[ "$REPLY" == "$add" ]]; then
+        # The form needs the direction, not the submenu mode.
+        case "$mode" in
+            open-R) provisioning_form R ;;
+            open-L) provisioning_form L ;;
+            *)      provisioning_form R ;;
+        esac
+        return 0
+    fi
     if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= total )); then
         local rec; rec="$(printf '%s\n' "$out" | sed -n "${REPLY}p")"
         local rslug rhost ruser rsport rdport
         IFS='|' read -r rslug rhost ruser rsport rdport <<< "$rec"
-        if [[ "$mode" == "stop" ]]; then
-            stop_tunnel "$rslug" "$rhost" "$rsport" "$rdport"
-        else
-            open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport"
-        fi
+        case "$mode" in
+            stop)   stop_tunnel "$rslug" "$rhost" "$rsport" "$rdport" ;;
+            open-R) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" R ;;
+            open-L) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" L ;;
+        esac
         return 0
     fi
     err "Invalid selection."
@@ -214,45 +250,52 @@ submenu() {
 
 # ============================================================ actions =========
 open_tunnel() {
-    local slug="$1" host="$2" user="$3" sport="$4" dport="$5"
+    local slug="$1" host="$2" user="$3" sport="$4" dport="$5" dir="$6"
     local params; params="$(grep -m1 '^SSH_PARAMS=' "$TUNNEL_DIR/$slug.tunnel" 2>/dev/null | cut -d'=' -f2-)"
 
-    # Already up? Say so, and report the process that holds it.
+    # Already up in this direction?
     local pid
-    if pid="$(tunnel_pid "$sport")"; then
-        ok "Tunnel $slug is already running (pid $pid)."
+    if pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
+        ok "Tunnel $slug is already running (pid $pid, -$dir)."
         return 0
     fi
 
-    # Blocked only when BOTH loopback families are taken. One free family is
-    # enough for ssh to bind.
-    if port_fully_taken "$sport"; then
-        local other; other="$(socket_owner_pids "$sport" | head -1)"
-        warn "Port $sport is held on both IPv4 and IPv6 by another process (pid ${other:-unknown})."
-        return 1
-    fi
-    # ssh binds BOTH loopback families for -L and aborts if either fails, so
-    # bind the free family explicitly.
-    local bindaddr
-    if family_in_use "$sport" ipv4; then
-        bindaddr="[::1]"
-        warn "127.0.0.1:$sport is held by another process — binding [::1]:$sport instead."
-    elif family_in_use "$sport" ipv6; then
-        bindaddr="127.0.0.1"
-        warn "[::1]:$sport is held by another process — binding 127.0.0.1:$sport instead."
-    else
-        bindaddr=""     # both free — let ssh pick
+    local bindaddr=""
+    if [[ "$dir" == "L" ]]; then
+        # A local forward binds HERE, so an occupied port on this side is a
+        # real conflict. ssh binds both loopback families for -L and aborts if
+        # either fails, so bind the free family explicitly.
+        if family_in_use "$sport" ipv4 && family_in_use "$sport" ipv6; then
+            local other; other="$(socket_owner_pids "$sport" | head -1)"
+            warn "Port $sport is held on both IPv4 and IPv6 by another process (pid ${other:-unknown})."
+            return 1
+        elif family_in_use "$sport" ipv4; then
+            bindaddr="[::1]"
+            warn "127.0.0.1:$sport is held by another process — binding [::1]:$sport instead."
+        elif family_in_use "$sport" ipv6; then
+            bindaddr="127.0.0.1"
+            warn "[::1]:$sport is held by another process — binding 127.0.0.1:$sport instead."
+        fi
     fi
 
+    # ExitOnForwardFailure makes ssh exit loudly if the forward cannot be
+    # established, instead of pretending to succeed.
+    # The forward is two separate arguments: "-L"/"-R", then the spec.
+    local -a fwd=( "-$dir" "${bindaddr:+$bindaddr:}${sport}:${TARGET_HOST}:${dport}" )
     # shellcheck disable=SC2086
     nohup "$TRANSPORT" -N $params \
         -o StrictHostKeyChecking=accept-new \
-        -L "${bindaddr:+$bindaddr:}${sport}:${TARGET_HOST}:${dport}" "$user@$host" \
+        -o ExitOnForwardFailure=yes \
+        "${fwd[@]}" "$user@$host" \
         > "$TUNNEL_DIR/$slug.log" 2>&1 < /dev/null &
-    sleep 2
+    sleep 3
 
-    if pid="$(tunnel_pid "$sport")"; then
-        ok "Tunnel started (pid $pid) — localhost:$sport → $TARGET_HOST:$dport"
+    if pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
+        if [[ "$dir" == "R" ]]; then
+            ok "Tunnel started (pid $pid) — $host:$sport → local:$TARGET_HOST:$dport  (-R)"
+        else
+            ok "Tunnel started (pid $pid) — local:$sport → $host:$dport  (-L)"
+        fi
     else
         err "Tunnel did not come up. Log:"
         [[ -f "$TUNNEL_DIR/$slug.log" ]] && sed 's/^/    /' "$TUNNEL_DIR/$slug.log"
@@ -263,7 +306,7 @@ open_tunnel() {
 stop_tunnel() {
     local slug="$1" host="$2" sport="$3" dport="$4"
     local pid
-    if ! pid="$(tunnel_pid "$sport")"; then
+    if ! pid="$(tunnel_pid "$sport" "$dport")"; then
         warn "Tunnel $slug is not running."
         return 0
     fi
@@ -273,46 +316,50 @@ stop_tunnel() {
     kill "$pid" 2>/dev/null || true
     if [[ -n "$parent" && "$parent" != "1" ]]; then
         local pcomm; pcomm="$(cat "/proc/$parent/comm" 2>/dev/null)"
-        [[ "$pcomm" == "autossh" ]] && { kill "$parent" 2>/dev/null || true; }
+        [[ "$pcomm" == "autossh" ]] && kill "$parent" 2>/dev/null || true
     fi
     sleep 1
-    # Anything still holding the port for this tunnel.
-    local p
-    for p in $(socket_owner_pids "$sport"); do
-        [[ "$p" == "$pid" ]] && continue
-        local c; c="$(cat "/proc/$p/comm" 2>/dev/null)"
-        case "$c" in ssh|autossh) kill "$p" 2>/dev/null || true ;; esac
+    # Any remaining process still carrying this forward.
+    local p cmd spec
+    for spec in "$(forward_spec L "$sport" "$dport")" "$(forward_spec R "$sport" "$dport")"; do
+        for p in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
+            [[ -r "/proc/$p/cmdline" ]] || continue
+            cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+            [[ "$cmd" == *"$spec"* ]] && kill "$p" 2>/dev/null || true
+        done
     done
     sleep 1
-    if tunnel_pid "$sport" >/dev/null 2>&1; then
-        warn "Port $sport is still held — the tunnel may need a moment to release it."
+    if tunnel_pid "$sport" "$dport" >/dev/null 2>&1; then
+        warn "Tunnel $slug is still running — the ssh process did not exit."
     else
         ok "Tunnel $slug stopped."
     fi
 }
 
-do_create()  { submenu "Create Tunnel to Server" open; }
-do_connect() { submenu "Connect Tunnel (to a server's Port)" open; }
+do_create()  { submenu "Create Tunnel to Server" open-R; }
+do_connect() { submenu "Connect Tunnel (to a server's Port)" open-L; }
 do_stop()    { submenu "Stop a tunnel" stop; }
 
 do_list() {
     printf '\n%s── List tunnels ──%s\n' "$C_BOLD" "$C_CYAN"
     local out; out="$(list_records)"
     if [[ -z "$out" ]]; then info "No tunnels registered."; return 0; fi
-    printf '  %-4s %-16s %-10s %-10s %s\n' "#" "HOST" "SOURCE" "DEST" "STATUS"
-    printf '  %-4s %-16s %-10s %-10s %s\n' "---" "----" "------" "----" "------"
+    printf '  %-4s %-18s %-9s %-9s %s\n' "#" "HOST" "PORT" "LOCAL" "STATUS"
+    printf '  %-4s %-18s %-9s %-9s %s\n' "---" "----" "----" "-----" "------"
     local n=0 line slug host user sport dport
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         n=$((n + 1))
         IFS='|' read -r slug host user sport dport <<< "$line"
-        printf '  %-4s %-16s %-10s %-10s %s\n' "$n" "$host" "$sport" "$dport" "$(status_text "$sport")"
+        printf '  %-4s %-18s %-9s %-9s %s\n' "$n" "$host" "$sport" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
     return 0
 }
 
 # ============================================================ provisioning ===
+# $1 is the direction the new tunnel will use.
 provisioning_form() {
+    local dir="${1:-R}"
     printf '\n%s── Add New Server ──%s\n' "$C_BOLD" "$C_CYAN"
     local last_host last_user
     last_host="$(cfg_get LAST_HOST "")"
@@ -326,8 +373,13 @@ provisioning_form() {
     ask "SSH Port" "$DEFAULT_SSH_PORT"; local sshport="$REPLY"
 
     printf '\n%sStep 2 — Tunnel%s\n' "$C_BOLD" "$C_RESET"
-    ask "Source Port (local bind)" "$sshport"; local sport="$REPLY"
-    ask "Destination Port (on the server)" "$sport"; local dport="$REPLY"
+    if [[ "$dir" == "R" ]]; then
+        printf '  %sThe server listens on the source port and forwards it back here.%s\n' "$C_DIM" "$C_RESET"
+    else
+        printf '  %sThis machine listens on the source port and forwards into the server.%s\n' "$C_DIM" "$C_RESET"
+    fi
+    ask "Source Port" "$sshport"; local sport="$REPLY"
+    ask "Destination Port" "$sport"; local dport="$REPLY"
     ask "SSH parameters" "$DEFAULT_SSH_PARAMS"; local params="$REPLY"
 
     for p in "$sport" "$dport"; do
@@ -336,7 +388,7 @@ provisioning_form() {
     [[ -n "$host" ]] || { err "Host is required."; return 1; }
 
     printf '\n%sStep 3 — Review%s\n' "$C_BOLD" "$C_RESET"
-    printf '  ssh -p %s %s -L %s:%s:%s %s@%s\n' "$sshport" "$params" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
+    printf '  ssh -p %s %s -%s %s:%s:%s %s@%s\n' "$sshport" "$params" "$dir" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
     ask "Save? [y/N]" "y"
     [[ "$EOF_REACHED" == "1" ]] && return 1
     [[ "${REPLY,,}" == "y" ]] || { warn "Cancelled."; return 1; }
@@ -348,7 +400,7 @@ provisioning_form() {
     cfg_set LAST_DEST_PORT "$dport"
     save_record "$host" "$user" "$sport" "$dport" "$params"
     local slug; slug="$(slug_of "$host" "$sport")"
-    open_tunnel "$slug" "$host" "$user" "$sport" "$dport"
+    open_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$dir"
 }
 
 # ------------------------------------------------------------------ menu ----
