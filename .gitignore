@@ -9,3 +9,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Built binaries (large, machine-specific; see scripts/build-oqs-ssh.sh)
+oqs-bin/

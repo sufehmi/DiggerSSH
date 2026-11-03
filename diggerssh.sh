@@ -30,6 +30,26 @@ SSH_DIR="$HOME/.ssh"
 # Remote registry: where a server records the tunnels currently pointed at it.
 REMOTE_REGISTRY_DIR=".diggerssh"
 
+# ------------------------------------------------------- ML-DSA capable ssh --
+# An OpenSSH build that understands standalone ML-DSA-65 lives in oqs-bin/
+# next to this script (built from the OQS-OpenSSH fork). The stock ssh on
+# most systems cannot even parse an ssh-mldsa-65 public key, so when those
+# binaries are present we put them first on PATH: key generation, the
+# algorithm probe and the tunnel itself then all use the ML-DSA-capable
+# tools. Override with DIGGERSH_NO_OQS=1 to force the system binaries.
+OQS_BIN_DIR=""
+if [[ "${DIGGERSH_NO_OQS:-0}" != "1" ]]; then
+  _self="${BASH_SOURCE[0]}"
+  [[ "$_self" != /* ]] && _self="$PWD/$_self"
+  _self_dir="$(cd -- "$(dirname -- "$_self")" 2>/dev/null && pwd)"
+  if [[ -n "$_self_dir" && -x "$_self_dir/oqs-bin/ssh-keygen" ]]; then
+    OQS_BIN_DIR="$_self_dir/oqs-bin"
+    PATH="$OQS_BIN_DIR:$PATH"
+    export PATH
+  fi
+  unset _self _self_dir
+fi
+
 # -------------------------------------------------------------- colours -----
 if [[ -t 1 ]] && [[ "${NO_COLOR:-}" == "" ]]; then
   C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
