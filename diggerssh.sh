@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.8.2 — SSH Tunnel Manager
+#  DiggerSSH v1.8.3 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -133,7 +133,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.8.2"
+VERSION="1.8.3"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -834,24 +834,33 @@ open_tunnel() {
         return 0
     fi
 
-    # An ssh process already carrying THIS port — in either direction —
-    # will make the bind fail. Say so up front, with the process that
-    # holds it, instead of letting ssh fail with "Address already in use"
-    # and an empty log.
+    # An ssh process already carrying THIS port IN THE SAME DIRECTION will
+    # make the bind fail: two -L tunnels bind the same port here, and two
+    # -R tunnels bind the same port on the server. Say so up front, with
+    # the process that holds it, instead of letting ssh fail with
+    # "Address already in use" and an empty log.
+    #
+    # The OPPOSITE direction does not collide. A -R binds the port on the
+    # server, a -L binds it here: they are two ends of one path and are
+    # meant to run side by side. Refusing the pair made the second menu
+    # unusable for the very record the first menu had just created.
     local holder hdir hspec
     while IFS=$'\t' read -r holder hdir hspec; do
         [[ -n "$holder" ]] || continue
-        warn "Port $sport is already carried by an ssh process (pid $holder, -$hdir $hspec)."
-        if [[ "$hdir" != "$dir" ]]; then
-            warn "  it is a -$hdir tunnel; this menu opens a -$dir tunnel."
+        if [[ "$hdir" == "$dir" ]]; then
+            warn "Port $sport is already carried by an ssh process (pid $holder, -$hdir $hspec)."
+            warn "  this menu opens a -$dir tunnel, and so does that one."
+            warn "  stop it first, then start this one."
+            local view; view="$(ps_view "$sport")"
+            if [[ -n "$view" ]]; then
+                warn "  ps auxw | grep $sport:"
+                printf '%s\n' "$view" | sed 's/^/    /' >&2
+            fi
+            return 1
         fi
-        warn "  stop it first, then start this one."
-        local view; view="$(ps_view "$sport")"
-        if [[ -n "$view" ]]; then
-            warn "  ps auxw | grep $sport:"
-            printf '%s\n' "$view" | sed 's/^/    /' >&2
-        fi
-        return 1
+        warn "Port $sport is also carried by a -$hdir tunnel (pid $holder)."
+        warn "  that one binds the port on the server, this one binds it here,"
+        warn "  so they do not collide — continuing."
     done < <(existing_tunnel "$sport")
 
     # Negotiate the algorithms against this server, once, and reuse them.
@@ -903,8 +912,29 @@ open_tunnel() {
         -o ExitOnForwardFailure=yes \
         "${algos[@]}" \
         "${fwd[@]}" "$user@$host"
-    setsid bash -c "$cmdline 2>&1 | awk '$LOG_FILTER_AWK'" \
-        > "$TUNNEL_DIR/$slug.log" 2>/dev/null < /dev/null &
+
+    # The PIDs carrying this port BEFORE the launch. A failed launch leaves
+    # an autossh supervisor behind, retrying forever; the next attempt then
+    # sees that supervisor and reports the port as carried by some
+    # unrelated process, with no way to clear it. Remembering what was
+    # already there lets the cleanup below remove only what this attempt
+    # started.
+    local before_pids=" " p_bp
+    while IFS=$'\t' read -r p_bp _ _; do
+        [[ -n "$p_bp" ]] && before_pids+="$p_bp "
+    done < <(tunnel_pids "$sport" "$dport")
+
+    # The exact command goes into the tunnel's log BEFORE the launch, so
+    # the log always shows what was attempted. An empty log used to be the
+    # only clue when a tunnel failed, and it said nothing at all.
+    local tlog="$TUNNEL_DIR/$slug.log"
+    : > "$tlog"
+    log_stamp "command: $TRANSPORT -N -p $sshport $params -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=yes ${algos[*]} ${fwd[*]} $user@$host" >> "$tlog"
+
+    # The transport's exit status is appended to the log when it ends, so a
+    # silent death is still recorded.
+    setsid bash -c "{ $cmdline 2>&1 | awk '$LOG_FILTER_AWK'; printf '[%s] transport exited with status %s\n' \"\$(date '+%Y-%m-%d %H:%M:%S')\" \"\${PIPESTATUS[0]}\"; }" \
+        >> "$tlog" 2>/dev/null < /dev/null &
     disown 2>/dev/null || true
     # Give the connection time to establish. autossh spawns ssh as a child,
     # so a short window can catch the process before it has bound. The test
@@ -951,6 +981,17 @@ open_tunnel() {
                 else
                     err "  it is not an ssh tunnel — free the port and retry."
                 fi
+                # Clean up this attempt's own supervisor so the next try is
+                # not blocked by a retrying process nobody can see.
+                local p3 pp3
+                for p3 in $(tunnel_pids "$sport" "$dport"); do
+                    [[ "$before_pids" == *" $p3 "* ]] && continue
+                    kill "$p3" 2>/dev/null
+                    pp3="$(ps -o ppid= -p "$p3" 2>/dev/null | tr -d ' ')"
+                    if [[ -n "$pp3" && "$pp3" != "1" && "$pp3" != "$$" ]]; then
+                        [[ "$(cat "/proc/$pp3/comm" 2>/dev/null)" == "autossh" ]] && kill "$pp3" 2>/dev/null
+                    fi
+                done
             else
                 err "  no local process owns it; the port is probably bound"
                 err "  on the server side of an -R tunnel."
@@ -966,11 +1007,27 @@ open_tunnel() {
                 err "  autossh is still retrying (pid $sup), but no ssh connection"
                 err "  was established — the tunnel is NOT up."
             fi
+            # Stop what this attempt started. A supervisor left retrying
+            # would make the next attempt report the port as carried by an
+            # unrelated process, and the tool had no way to clear it.
+            local p2 pp2 cleaned=0
+            for p2 in $(tunnel_pids "$sport" "$dport"); do
+                [[ "$before_pids" == *" $p2 "* ]] && continue
+                kill "$p2" 2>/dev/null && cleaned=1
+                pp2="$(ps -o ppid= -p "$p2" 2>/dev/null | tr -d ' ')"
+                if [[ -n "$pp2" && "$pp2" != "1" && "$pp2" != "$$" ]]; then
+                    [[ "$(cat "/proc/$pp2/comm" 2>/dev/null)" == "autossh" ]] && kill "$pp2" 2>/dev/null
+                fi
+            done
+            if (( cleaned )); then
+                err "  the failed attempt was cleaned up; nothing is left retrying."
+            fi
             if [[ -n "$log" ]]; then
                 err "  Log:"
                 printf '%s\n' "$log" | sed 's/^/    /'
             else
-                err "  (the ssh process wrote nothing to its log)"
+                err "  ssh produced no output at all — it exited without saying why."
+                err "  The log holds the exact command that was run."
             fi
             # Show what ps sees for this port, so the cause is visible
             # without leaving the tool.
@@ -1296,14 +1353,25 @@ socket_owner_pids() {
 }
 
 # Whether a listener on $1 exists in the given address family.
+#
+# A WILDCARD listener counts: a socket on 0.0.0.0:P blocks a bind of
+# 127.0.0.1:P, and one on [::]:P blocks [::1]:P. Only the exact address
+# used to be looked for, so a wildcard holder was invisible here — the
+# tool believed the port was free, ssh died on the bind, and the log held
+# nothing but "Address already in use" with no hint as to who held it.
 family_in_use() {
-    local port="$1" family="$2" addr
+    local port="$1" family="$2"
+    local -a addrs=()
     case "$family" in
-        ipv4) addr="127.0.0.1:${port}" ;;
-        ipv6) addr="[::1]:${port}" ;;
+        ipv4) addrs=( "127.0.0.1:${port}" "0.0.0.0:${port}" "*:${port}" ) ;;
+        ipv6) addrs=( "[::1]:${port}" "[::]:${port}" "*:${port}" ) ;;
         *) return 1 ;;
     esac
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$addr"
+    local a
+    for a in "${addrs[@]}"; do
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$a" && return 0
+    done
+    return 1
 }
 
 init_state() {

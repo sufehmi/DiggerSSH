@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.2** — a single-file Bash SSH tunnel manager.
+**v1.8.3** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -30,10 +30,10 @@ holding the port.
   - [Delete a tunnel or server](#delete-a-tunnel-or-server)
 - [The two forwarding directions](#the-two-forwarding-directions)
 - [How status is determined](#how-status-is-determined)
-- [How status is determined](#how-status-is-determined)
   - [autossh is a supervisor, not the tunnel](#autossh-is-a-supervisor-not-the-tunnel)
   - [The SSH port](#the-ssh-port)
   - [Log files](#log-files)
+  - [Diagnosing a tunnel that did not come up](#diagnosing-a-tunnel-that-did-not-come-up)
 - [Key exchange fallback](#key-exchange-fallback)
 - [autossh](#autossh)
 - [Post-quantum (ML-DSA-65) support](#post-quantum-ml-dsa-65-support)
@@ -125,7 +125,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.2  SSH tunnel manager
+   v1.8.3  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -293,9 +293,10 @@ tunnel; the destination may be any `host:port`, and the bind address may
 be spelled several ways, so neither is compared.
 
 Before a tunnel is started the port is checked the same way. An `ssh`
-process already carrying that port cannot be bound again — `ssh` would
-exit with `Address already in use` and the tunnel would never come up —
-so the holder is named up front, with its pid and command line:
+process already carrying that port **in the same direction** cannot be
+bound again — `ssh` would exit with `Address already in use` and the
+tunnel would never come up — so the holder is named up front, with its
+pid and command line:
 
 ```
 ! Port 44641 is already carried by an ssh process (pid 363872, -L [::1]:44641:127.0.0.1:44641).
@@ -305,6 +306,41 @@ so the holder is named up front, with its pid and command line:
 
 The same `ps` view is printed when a tunnel fails to come up, so the
 cause is visible without leaving the tool.
+
+### The two directions do not collide
+
+A `-R` tunnel binds its port **on the server**; a `-L` tunnel binds it
+**here**. They are the two ends of one path, so a `-R` and a `-L` on the
+same port can — and often should — run at the same time.
+
+The preflight is therefore direction-aware. A duplicate in the same
+direction is refused:
+
+```
+! Port 44641 is already carried by an ssh process (pid 363872, -L ...).
+!   this menu opens a -L tunnel, and so does that one.
+!   stop it first, then start this one.
+```
+
+A tunnel in the *opposite* direction is allowed, with a note saying so:
+
+```
+! Port 44641 is also carried by a -R tunnel (pid 379221).
+!   that one binds the port on the server, this one binds it here,
+!   so they do not collide — continuing.
+```
+
+Before v1.8.3 the preflight was direction-blind and refused the pair
+outright, which made the second menu unusable for the very record the
+first menu had just created.
+
+### Wildcard listeners count as "in use"
+
+A socket on `0.0.0.0:PORT` or `[::]:PORT` blocks a bind of
+`127.0.0.1:PORT` / `[::1]:PORT`. The port check looks for those
+addresses too, not just the exact loopback ones — otherwise the tool
+believed a port was free, `ssh` died on the bind, and the only clue was
+an `Address already in use` with no hint as to who held it.
 
 ### autossh is a supervisor, not the tunnel
 
@@ -382,6 +418,31 @@ one explicitly in the forward argument:
 ```
 ! 127.0.0.1:44641 is held by another process — binding [::1]:44641 instead.
 ```
+
+### Diagnosing a tunnel that did not come up
+
+The tunnel's own log always begins with the exact command that was run,
+so there is never a blank file to puzzle over:
+
+```
+[2026-11-04 00:27:36] command: autossh -N -p 2222 -o ServerAliveInterval=30 ... -L 45521:127.0.0.1:45521 sufehmi@server2.mafindo.or.id
+[2026-11-04 00:27:36] ssh: connect to host server2.mafindo.or.id port 2222: Network is unreachable
+[2026-11-04 00:27:36] transport exited with status 1
+```
+
+The last line is the transport's exit status, appended when it ends, so
+a silent death is still recorded.
+
+Two more things happen on failure that used not to:
+
+- **The failed attempt is cleaned up.** A failed launch used to leave an
+  `autossh` supervisor retrying forever. The next attempt then found
+  that supervisor and reported the port as carried by an unrelated
+  process — with no way to clear it. Only the processes this attempt
+  started are killed; pre-existing ones are left alone.
+- **The reason is named.** The old message was "the ssh process wrote
+  nothing to its log". Now the log contents are printed, or, if there
+  genuinely are none, it says so explicitly and points at the command.
 
 ---
 
