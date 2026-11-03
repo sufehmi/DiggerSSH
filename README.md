@@ -1,19 +1,36 @@
-# DiggerSSH
-
-**Tailscale but simple and free.**
-
-An SSH Tunnel Manager — a single-file Bash script for provisioning and managing SSH port-forward tunnels, with post-quantum (ML-DSA-65) key support where the local OpenSSH build provides it.
-
+```text
+    ____  _                       __________ __  __
+   / __ \(_)___ _____ ____  _____/ ___/ ___// / / /
+  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
+ / /_/ / / /_/ / /_/ /  __/ /   ___/ /__/ / __  /
+/_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
+        /____//____/
 ```
-╔══════════════════════════════════════╗
-║  DiggerSSH  v1.1.0                  ║
-╚══════════════════════════════════════╝
-  1) Create Tunnel
-  2) Connect Tunnel
-  3) List tunnels
-  4) Stop a tunnel
-  0) Exit
-```
+
+**v1.2.0** — an SSH tunnel manager with post-quantum (ML-DSA-65) support.
+
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Create Tunnel](#create-tunnel)
+  - [Connect Tunnel](#connect-tunnel)
+  - [Other menu entries](#other-menu-entries)
+- [Key types & the ML-DSA-65 reality](#key-types-the-ml-dsa-65-reality)
+  - [The fallback chain](#the-fallback-chain)
+  - [The decision is recorded in the config file](#the-decision-is-recorded-in-the-config-file)
+  - [The `PubkeyAcceptedAlgorithms` requirement](#the-pubkeyacceptedalgorithms-requirement)
+- [autossh](#autossh)
+- [Server-side registry](#server-side-registry)
+- [Files & layout](#files-layout)
+  - [On this machine](#on-this-machine)
+  - [On the server](#on-the-server)
+- [How the tunnel works](#how-the-tunnel-works)
+- [Security notes](#security-notes)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 

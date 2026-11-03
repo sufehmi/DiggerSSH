@@ -17,7 +17,7 @@
 #
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_NAME="DiggerSSH"
 
 # ---------------------------------------------------------------- paths -----
@@ -1031,9 +1031,13 @@ connect_tunnel() {
 # ============================================================ MAIN MENU ======
 main_menu() {
   while true; do
-    printf '\n%s%s╔══════════════════════════════════════╗%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s║%s  %s%-10s%s%s v%s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_BOLD" "DiggerSSH" "$C_RESET" "$C_RESET" "$VERSION" "$C_RESET"
-    printf '%s%s╚══════════════════════════════════════╝%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s    ____  _                       __________ __  __%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s   / __ \(_)___ _____ ____  _____/ ___/ ___// / / /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s / /_/ / / /_/ / /_/ /  __/ /   ___/ /__/ / __  /%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s/_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s%s        /____//____/%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '  %sv%s%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
     printf '  %s1%s) Create Tunnel\n' "$C_GREEN" "$C_RESET"
     printf '  %s2%s) Connect Tunnel\n' "$C_GREEN" "$C_RESET"
     printf '  %s3%s) List tunnels\n'   "$C_GREEN" "$C_RESET"
