@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.6.0** — a single-file Bash SSH tunnel manager.
+**v1.6.1** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing

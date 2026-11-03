@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.6.0 — SSH Tunnel Manager
+#  DiggerSSH v1.6.1 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -60,7 +60,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
