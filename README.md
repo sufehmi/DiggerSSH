@@ -1,13 +1,20 @@
+# DiggerSSH
+
 ```text
     ____  _                       __________ __  __
    / __ \(_)___ _____ ____  _____/ ___/ ___// / / /
-  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
- / /_/ / / /_/ / /_/ /  __/ /   ___/ /__/ / __  /
+  / / / / / __ `/ __ `/ _ \/ ___/\__ \__ \/ /_/ /
+ / /_/ / / /_/ / /_/ /  __/ /   ___/ /__/ / __ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
 ```
 
-**v1.3.0** — an SSH tunnel manager with post-quantum (ML-DSA-65) support.
+**v1.5.1** — a single-file Bash SSH tunnel manager.
+
+DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
+the tunnels you configure, lets you create new ones and re-open existing
+ones, and reports their live status by asking the kernel who is actually
+holding the port.
 
 ## Table of Contents
 
@@ -15,19 +22,18 @@
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
-  - [Create Tunnel](#create-tunnel)
-  - [Connect Tunnel](#connect-tunnel)
-  - [Other menu entries](#other-menu-entries)
-- [Key types & the ML-DSA-65 reality](#key-types-the-ml-dsa-65-reality)
-  - [The fallback chain](#the-fallback-chain)
-  - [The decision is recorded in the config file](#the-decision-is-recorded-in-the-config-file)
-  - [The `PubkeyAcceptedAlgorithms` requirement](#the-pubkeyacceptedalgorithms-requirement)
+  - [The main menu](#the-main-menu)
+  - [Create Tunnel to Server](#create-tunnel-to-server)
+  - [Connect Tunnel (to a server's Port)](#connect-tunnel-to-a-servers-port)
+  - [List tunnels](#list-tunnels)
+  - [Stop a tunnel](#stop-a-tunnel)
+- [The two forwarding directions](#the-two-forwarding-directions)
+- [How status is determined](#how-status-is-determined)
 - [autossh](#autossh)
-- [Server-side registry](#server-side-registry)
-- [Files & layout](#files-layout)
+- [Post-quantum (ML-DSA-65) support](#post-quantum-ml-dsa-65-support)
+  - [A note on key types](#a-note-on-key-types)
+- [Files & layout](#files--layout)
   - [On this machine](#on-this-machine)
-  - [On the server](#on-the-server)
-- [How the tunnel works](#how-the-tunnel-works)
 - [Security notes](#security-notes)
 - [Contributing](#contributing)
 - [License](#license)
@@ -36,16 +42,30 @@
 
 ## Features
 
-- **Two-step tunnel creation** — `Create Tunnel` provisions the key, collects connection details, installs the public key on the remote server if needed, and starts the tunnel. `Connect Tunnel` re-establishes a previously saved tunnel.
-- **Post-quantum key support with automatic fallback** — DiggerSSH negotiates a key type that **both** the local client and the remote server accept, walking a four-level chain and recording the outcome in the config file (see [Key types](#key-types--the-ml-dsa-65-reality)).
-- **Automatic key provisioning** — generates a passphrase-less keypair in `~/.ssh/` on first run, and reuses an existing key of the correct type on later runs.
-- **Self-healing authentication** — if public-key auth fails, DiggerSSH prompts for the SSH password and installs the public key into the remote `~/.ssh/authorized_keys` automatically. If that also fails, it prints the exact commands to run manually and waits for your confirmation.
-- **Server-side tunnel registry** — every tunnel you create is recorded in `~/.diggerssh/` **on the server**, so `Connect Tunnel` can list and re-establish tunnels even after the local state is deleted.
-- **Survives dropped connections** — uses [autossh](http://www.haproxy.org/download/1.8/doc/autossh.txt) when it is available so the tunnel re-establishes itself after a network drop; falls back to plain `ssh` when it is not.
-- **Custom SSH parameters** — the `Create Tunnel` form takes an **SSH parameters** field (default `-o ServerAliveInterval=30 -o ServerAliveCountMax=5`) that is stored with the tunnel and reused on every reconnect.
-- **Remembered defaults** — the last server, username and SSH port are stored and offered as defaults on the next run.
-- **Tunnel persistence** — saved tunnels can be listed, reconnected, and stopped from the menu.
-- **No dependencies** — pure Bash 4+ plus `ssh` / `ssh-keygen`. `autossh` is optional and only improves reliability.
+- **Two menus, two forwarding directions** — `Create Tunnel to Server` opens a
+  **remote** forward (`-R`): the server listens on the port and pipes the
+  traffic back to this machine. `Connect Tunnel (to a server's Port)` opens a
+  **local** forward (`-L`): this machine listens and forwards into the server.
+- **A registry of your tunnels** — every tunnel you configure is stored under
+  `~/.diggerssh/tunnels/` and listed in the menu, so you re-open a tunnel by
+  number instead of re-typing its details.
+- **Live status straight from the kernel** — status is decided by looking up
+  the process that actually holds the port, so the list, the connect action
+  and the stop action can never disagree with each other.
+- **Precise stopping** — stopping a tunnel kills the exact `ssh` process
+  carrying that forward, never a pattern-matched approximation.
+- **Per-family port checks** — a port can be busy on IPv4 and free on IPv6;
+  DiggerSSH checks each family separately and binds whichever is free.
+- **Custom SSH parameters** — the form takes free-form **SSH parameters**
+  (default `-o ServerAliveInterval=30 -o ServerAliveCountMax=5`) that are
+  stored with the tunnel and reused on every reconnect.
+- **Remembered defaults** — the last host, username and ports are stored and
+  offered as editable defaults next time.
+- **Survives dropped connections** — uses [autossh](http://www.haproxy.org/download/1.8/doc/autossh.txt)
+  when it is installed so the tunnel re-establishes itself after a network
+  drop; falls back to plain `ssh` when it is not.
+- **No dependencies** — pure Bash 4+ plus `ssh`. `autossh` is optional and
+  only improves reliability.
 
 ---
 
@@ -53,11 +73,10 @@
 
 | Requirement | Notes |
 |---|---|
-| Bash | 4.0 or newer (uses `read -r`, arrays, `[[ ]]`) |
+| Bash | 4.0 or newer (uses arrays, `[[ ]]`, `read -r`) |
 | `ssh` | OpenSSH client |
-| `ssh-keygen` | OpenSSH client |
 | `autossh` | Optional — auto-restarts the tunnel if the link drops |
-| `ss` | Optional — used to detect port conflicts |
+| `ss` | Optional — used for per-family port checks |
 
 Tested on **Debian 13 (trixie)** with **OpenSSH 10.0p2**.
 
@@ -88,220 +107,225 @@ Launch the menu:
 diggerssh
 ```
 
-### Create Tunnel
+### The main menu
 
-1. **Key material** — DiggerSSH checks whether a key of the preferred type already exists in `~/.ssh/`. If not, it generates one with **no passphrase**, directly in `~/.ssh/`.
-2. **Connection details** — prompted with sensible defaults:
+```
+   ____  _                       __________ __  __
+  / __ \(_)___ _____ ____  _____/ ___/ ___// / / /
+ / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
+/_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
+        /____//____/
+   v1.5.1  SSH tunnel manager
 
-   | Prompt | Default |
-   |---|---|
-   | Server IP Address/Domain Name | last server used |
-   | SSH Username | last username used |
-   | Source Port | — (required) |
-   | Destination Port | same as Source Port |
-   | SSH Port | `22` |
-   | SSH parameters | `-o ServerAliveInterval=30 -o ServerAliveCountMax=5` |
+  1) Create Tunnel to Server
+  2) Connect Tunnel (to a server's Port)
+  3) List tunnels
+  4) Stop a tunnel
+  0) Exit
+```
 
-   **SSH parameters** is passed straight through to `ssh` / `autossh`, so any
-   `-o` option works — for example `-o ServerAliveInterval=60`, or
-   `-o ProxyJump=bastion`. The value is stored with the tunnel and reused
-   every time you reconnect it.
+Each of the first four entries opens a submenu listing your tunnels, with
+`+ Add new server` and `Exit to main menu` as the final entries. `List
+tunnels` is a plain report and returns to the main menu immediately.
 
-3. **Key negotiation** — DiggerSSH asks the server which signature algorithms it accepts and picks the strongest key type that **both** sides support (see [Key types](#key-types--the-ml-dsa-65-reality)). The decision is written to the config file.
-4. **Review & Submit** — the configuration is displayed for confirmation before anything is touched on the remote host.
-5. **Establish** — DiggerSSH tests public-key authentication. On failure it falls back to a password login to install the public key, then re-tests. If that fails too, it prints manual instructions and waits for you.
-6. **Tunnel up** — the forward is established as:
+### Create Tunnel to Server
 
-   ```
-   autossh -N -f -L <source_port>:127.0.0.1:<dest_port> user@server
-   ```
+Choosing `+ Add new server` starts the provisioning form:
 
-   so `localhost:<source_port>` transparently reaches the service on the remote host. With `autossh` the tunnel re-establishes itself automatically after a dropped connection; with plain `ssh` it does not.
+**Step 1 — Server**
 
-### Connect Tunnel
+| Prompt | Default |
+|---|---|
+| Server IP Address/Domain Name | last host used |
+| SSH Username | last username used |
+| SSH Port | `22` (this is ssh's `-p` argument) |
 
-Lists saved tunnels with their live status, then re-establishes the one you pick. If the key file has gone missing it is regenerated; if authentication fails the same password/manual fallback chain runs.
+**Step 2 — Tunnel**
 
-The menu shows two groups:
+| Prompt | Default |
+|---|---|
+| Source Port | the SSH port entered above |
+| Destination Port | the Source Port just entered |
+| SSH parameters | `-o ServerAliveInterval=30 -o ServerAliveCountMax=5` |
 
-- **Saved tunnels (local)** — tunnels recorded in `~/.diggerssh/tunnels/` on *this* machine.
-- **Tunnels registered on `user@server`** — tunnels recorded in `~/.diggerssh/` on the *remote server* (see [Server-side registry](#server-side-registry)). These survive the loss of local state, so you can re-establish a tunnel from a different machine that has the same key.
+Every default is shown in brackets and is editable — press Enter to accept it.
 
-### Other menu entries
+**Step 3 — Review** shows the exact command that will run, for example:
 
-- **3) List tunnels** — show every saved tunnel and whether it is running.
-- **4) Stop a tunnel** — stop a running tunnel by ID.
+```
+ssh -p 22 -o ServerAliveInterval=30 -o ServerAliveCountMax=5 -R 44641:127.0.0.1:44641 sufehmi@server2.mafindo.or.id
+```
+
+**SSH parameters** is passed straight through to `ssh` / `autossh`, so any
+`-o` option works — for example `-o ServerAliveInterval=60`, or
+`-o ProxyJump=bastion`. The value is stored with the tunnel and reused every
+time you re-open it.
+
+### Connect Tunnel (to a server's Port)
+
+Lists your tunnels with their live status, then opens the one you pick using
+a **local** forward (`-L`). The local port matches the port the tunnel uses
+on the server, so both ends use the same number.
+
+### List tunnels
+
+Prints every configured tunnel with its host, source port, destination port
+and current status, then returns to the main menu.
+
+### Stop a tunnel
+
+Lists your tunnels, asks which one to terminate, and kills the `ssh` process
+carrying that forward. The `autossh` supervisor is killed before its `ssh`
+child so it cannot resurrect the tunnel.
 
 ---
 
-## Key types & the ML-DSA-65 reality
+## The two forwarding directions
 
-DiggerSSH was written to use **ML-DSA-65** post-quantum keys, but there is an important constraint worth understanding up front.
+DiggerSSH uses both SSH forwarding modes, one per menu entry.
 
-**`ssh-keygen -t ml-dsa-65` is not available in stock OpenSSH releases.** As of OpenSSH 10.6 the upstream client supports:
-
-- `mldsa44-ed25519` — a **composite** ML-DSA-44 + Ed25519 signature (added in OpenSSH 10.4, enabled by default in 10.6). Not ML-DSA-65.
-- The standalone `ssh-mldsa-65` public key algorithm is specified in the IETF draft [`draft-sfluhrer-ssh-mldsa`](https://datatracker.ietf.org/doc/html/draft-sfluhrer-ssh-mldsa-08), but **upstream OpenSSH does not implement it yet**.
-
-A standalone ML-DSA-65 implementation does exist in the [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh) fork, which exposes the key type as `mldsa-65`.
-
-Rather than hard-coding a key type that would fail on most systems, DiggerSSH **probes the local `ssh-keygen`** at startup and picks the best available type.
-
-### The fallback chain
-
-A key type is usable only when **both** ends agree on it:
-
-1. the local `ssh-keygen` can **produce** the key, and
-2. the remote server **accepts** the wire algorithm.
-
-So DiggerSSH walks this chain from the top and stops at the first level that satisfies both conditions:
-
-| Level | Key type | Wire algorithm | Notes |
-|---|---|---|---|
-| 0 | `ssh-mldsa-65` | `ssh-mldsa-65` | Standalone ML-DSA-65, post-quantum (OQS-OpenSSH) |
-| 1 | `ssh-mldsa44-ed25519@openssh.com` | same | ML-DSA-44 + Ed25519 composite, upstream OpenSSH 10.4+ |
-| 2 | `ssh-ed25519` | `ssh-ed25519` | Universal fallback |
-| 3 | `ecdsa-sha2-nistp256` | same | Last resort |
-
-If the server rejects the level currently in use, DiggerSSH says so and steps down to the next one automatically:
+**`Create Tunnel to Server` → `-R` (remote forward).** The listener is
+created **on the server**, on the source port. Traffic arriving there is
+carried down the SSH connection and delivered to `127.0.0.1:<destination>` on
+this machine.
 
 ```
-[!] Server does not accept ssh-mldsa-65 — falling back to the next key type.
+ssh -p 22 -R 44641:127.0.0.1:44641 sufehmi@server2.mafindo.or.id
 ```
 
-The server's accepted algorithms are read from the `server-sig-algs` list that
-`ssh` prints during key exchange — that happens **before** authentication, so
-the negotiation works even on the first run when you cannot log in yet.
-
-### The decision is recorded in the config file
-
-`~/.diggerssh/config` states plainly which level was chosen and why:
-
 ```
-KEY_TYPE=ed25519
-KEY_ALGORITHM=ssh-ed25519
-KEY_LABEL=Ed25519
-KEY_LEVEL=2
-KEY_FILE=/home/user/.ssh/id_ed25519
-KEY_UPDATED=2026-11-03 16:04:29
-KEY_FALLBACK_NOTE=fell back to Ed25519: ML-DSA-65 and ML-DSA-44 composite unavailable in the ssh client or rejected by the server
+   client (this machine)                server
+  ┌────────────────────┐            ┌──────────────────────┐
+  │  127.0.0.1:44641   │ ──SSH──▶  │  listener :44641     │
+  │  (local service)   │ ◀──────── │  → 127.0.0.1:44641   │
+  └────────────────────┘            └──────────────────────┘
 ```
 
-`KEY_LEVEL` is the position in the chain (0 = strongest) and
-`KEY_FALLBACK_NOTE` explains the downgrade in plain words.
-
-The active type is also printed during the run:
+**`Connect Tunnel (to a server's Port)` → `-L` (local forward).** The
+listener is created **on this machine**, on the source port, and forwards
+into the server's port.
 
 ```
-Key type: Ed25519 (ssh-ed25519)
+ssh -p 22 -L 44641:127.0.0.1:44641 sufehmi@server2.mafindo.or.id
 ```
 
-On a stock OpenSSH 10.0p2 system you will see `Ed25519`, because that build predates upstream's ML-DSA support. To get genuine ML-DSA-65 keys, use a build of `ssh-keygen` that supports the type — for example the OQS-OpenSSH fork:
+```
+   client (this machine)                server
+  ┌────────────────────┐            ┌──────────────────────┐
+  │  listener :44641   │ ──SSH──▶  │  127.0.0.1:44641     │
+  │  → remote service  │ ◀──────── │  (remote service)    │
+  └────────────────────┘            └──────────────────────┘
+```
+
+Both forms bind the loopback interface only, so the forwarded port is not
+reachable from the network.
+
+---
+
+## How status is determined
+
+A tunnel's status is not guessed from a PID file. The local process that
+carries the forward argument **is** the tunnel, so DiggerSSH finds it by
+matching the exact `-L`/`-R` argument in `/proc`:
 
 ```bash
-# Generate an ML-DSA-65 key with the OQS-OpenSSH ssh-keygen
-ssh-keygen -t mldsa-65 -N "" -f ~/.ssh/id_mldsa65
+pgrep -x ssh; pgrep -x autossh      # then match the forward spec in /proc/PID/cmdline
 ```
 
-### The `PubkeyAcceptedAlgorithms` requirement
+This matters because:
 
-Merely having an ML-DSA key is not enough. A client only offers a key whose
-signature algorithm appears in its `PubkeyAcceptedAlgorithms` list — and the
-OQS-OpenSSH build knows the standalone ML-DSA algorithms but **does not enable
-them by default**. Without intervention, ssh skips the key with:
+- `autossh` forks an `ssh` child, and with `-f` the supervisor exits at
+  once — a PID captured from `$!` is either the wrong process or already
+  dead.
+- `pkill -f` on a port pattern matches far too much, including the shell
+  running DiggerSSH itself.
+- A port can be held by a process that is not a tunnel at all. Such a
+  process is reported as a conflict, never as a running tunnel.
 
-```
-debug1: Skipping ssh-mldsa-65 key /home/user/.ssh/id_mldsa65 - corresponding algorithm not in PubkeyAcceptedAlgorithms
-```
+Because status, connect and stop all read the same source, they cannot
+disagree with one another.
 
-DiggerSSH therefore adds the option itself when the local ssh genuinely
-supports it, and prints what it did:
-
-```
-Key type available: ML-DSA-65 (post-quantum)
-SSH algorithms: -o PubkeyAcceptedAlgorithms=+ssh-mldsa-65 -o HostKeyAlgorithms=+ssh-mldsa-65
-```
-
-The check is deliberately conservative, because **stock ssh refuses to start
-if it is asked for an algorithm it has never heard of**:
+**Address families.** A port can be busy on IPv4 and free on IPv6, and vice
+versa. `ssh` binds *both* loopback families for a forward and aborts if
+either fails, so DiggerSSH checks each family separately and names the free
+one explicitly in the forward argument:
 
 ```
-command-line line 0: Bad key types '+ssh-mldsa-65'.
+! 127.0.0.1:44641 is held by another process — binding [::1]:44641 instead.
 ```
-
-So the option is only added when `ssh -Q PubkeyAcceptedAlgorithms` lists the
-algorithm *and* it is not already in the effective default. On a stock
-OpenSSH system DiggerSSH therefore prints no algorithm line at all and uses
-Ed25519 as before.
 
 ---
 
 ## autossh
 
-`autossh` wraps `ssh` and restarts the tunnel whenever the connection drops —
-the practical difference between a tunnel that silently dies after an idle
-period and one that comes back on its own.
+When `autossh` is on `PATH` it is used as the transport, so the tunnel
+re-establishes itself after a dropped connection:
 
-DiggerSSH uses `autossh` when it is installed. If it is not, it offers to
-install it with the system package manager (`apt`, `dnf`, `yum`, `pacman`,
-`zypper`, or `brew`):
-
-```
-[!] autossh is not installed on this system.
-[+] autossh restarts the tunnel automatically when the connection drops.
-Try to install autossh now? [y/N]
+```bash
+autossh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=5 \
+  -o ExitOnForwardFailure=yes -R 44641:127.0.0.1:44641 user@host
 ```
 
-If you decline, or the install is not possible, DiggerSSH continues with
-plain `ssh` and tells you what that means:
-
-```
-[!] Continuing with plain ssh — the tunnel will not survive a dropped connection.
-```
-
-The choice is not permanent: install `autossh` at any time and DiggerSSH
-will use it on the next run.
+Without `autossh`, plain `ssh` is used and the tunnel does not survive a
+network drop.
 
 ---
 
-## Server-side registry
+## Post-quantum (ML-DSA-65) support
 
-Every tunnel you create is recorded **on the server**, in `~/.diggerssh/`:
-
-```
-~/.diggerssh/
-└── 127.0.0.1-sufehmi-9961.tunnel
-```
-
-Each record holds the details needed to re-establish the tunnel:
+The upstream OpenSSH client can negotiate **ML-DSA-65** post-quantum keys
+when it is built against a provider that supports them. DiggerSSH prefers a
+bundled such build when one is present next to the script:
 
 ```
-ID=127.0.0.1-sufehmi-9961
-HOST=127.0.0.1
-USER=sufehmi
-SOURCE_PORT=9961
-DEST_PORT=2232
-SSH_PORT=2232
-KEY_TYPE=ed25519
-KEY_LABEL=Ed25519
-SSH_PARAMS=-o ServerAliveInterval=30 -o ServerAliveCountMax=5
-CREATED=2026-11-03 16:04:29
+diggerssh.sh
+oqs-bin/          ← optional: ssh, sshd, ssh-keygen, … built with OQS-OpenSSH
 ```
 
-The directory is created with mode `700` and the records with mode `600`, and
-it is written via a single `ssh` call so the key never reaches a remote
-command line.
+If `oqs-bin/ssh` exists, that directory is prepended to `PATH` for the
+session, so the key generation and the live tunnel use the same
+implementation. Set `DIGGERSH_NO_OQS=1` to force the system binaries
+instead:
 
-`Connect Tunnel` reads this registry back and lists what it finds:
-
-```
-Tunnels registered on sufehmi@127.0.0.1:
-   2) 127.0.0.1-sufehmi-9961  sufehmi@127.0.0.1  127.0.0.1:9961 -> :2232  [server]
+```bash
+DIGGERSH_NO_OQS=1 ./diggerssh.sh
 ```
 
-Because the registry lives on the server, **the tunnel outlives your local
-state** — delete `~/.diggerssh/` on your laptop and the tunnel is still
-listed and re-establishable from any machine that holds the same key.
+`oqs-bin/` is **not** committed — it is 18 MB of machine-specific binaries.
+See `scripts/build-oqs-ssh.sh` for how to build one.
+
+### A note on key types
+
+`ml-dsa-65` is not available in stock OpenSSH releases. Upstream OpenSSH
+supports `mldsa44-ed25519`, a **composite** ML-DSA-44 + Ed25519 signature
+(OpenSSH 10.4+), not the standalone ML-DSA-65. A standalone implementation
+exists in the [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh)
+fork, which exposes the key type as `mldsa-65`:
+
+```bash
+ssh-keygen -t mldsa-65 -N "" -f ~/.ssh/id_mldsa65
+```
+
+Merely having such a key is not enough — a client only offers a key whose
+signature algorithm appears in its `PubkeyAcceptedAlgorithms` list, and the
+OQS build does not enable the standalone ML-DSA algorithms by default:
+
+```
+debug1: Skipping ssh-mldsa-65 key /home/user/.ssh/id_mldsa65 - corresponding algorithm not in PubkeyAcceptedAlgorithms
+```
+
+Add the option yourself when your build supports it:
+
+```bash
+ssh -o PubkeyAcceptedAlgorithms=+ssh-mldsa-65 -o HostKeyAlgorithms=+ssh-mldsa-65 ...
+```
+
+The check must be conservative, because **stock ssh refuses to start if it
+is asked for an algorithm it has never heard of**:
+
+```
+command-line line 0: Bad key types '+ssh-mldsa-65'.
+```
 
 ---
 
@@ -311,18 +335,24 @@ listed and re-establishable from any machine that holds the same key.
 
 | Path | Purpose |
 |---|---|
-| `~/.diggerssh/config` | Last-used server/username/port, and the negotiated key type |
-| `~/.diggerssh/tunnels/<id>.conf` | Saved tunnel definitions |
-| `~/.diggerssh/tunnels/<id>.pid` | PID of the running tunnel |
-| `~/.diggerssh/tunnels/<id>.log` | ssh log for that tunnel |
+| `~/.diggerssh/config` | Last-used host, username, ports |
+| `~/.diggerssh/tunnels/<id>.tunnel` | One file per tunnel (`KEY=value` lines) |
+| `~/.diggerssh/tunnels/<id>.log` | Output of that tunnel's `ssh` process |
 | `~/.diggerssh/diggerssh.log` | Script activity log |
-| `~/.ssh/id_mldsa65` | Generated keypair (name varies by key type) |
 
-### On the server
+A tunnel record looks like this:
 
-| Path | Purpose |
-|---|---|
-| `~/.diggerssh/<id>.tunnel` | Registry entry for one tunnel |
+```
+HOST=server2.mafindo.or.id
+USER=sufehmi
+SOURCE_PORT=44641
+DEST_PORT=44641
+SSH_PARAMS=-o ServerAliveInterval=30 -o ServerAliveCountMax=5
+CREATED=2026-11-03\ 19:15:29
+```
+
+There is deliberately **no** PID file: the owning process is discovered from
+the kernel at the moment it is needed, so the file can never go stale.
 
 Override the state directory with `DIGGERSH_HOME`:
 
@@ -330,36 +360,31 @@ Override the state directory with `DIGGERSH_HOME`:
 DIGGERSH_HOME=/tmp/diggerssh ./diggerssh.sh
 ```
 
-> The server-side registry path is **not** affected by `DIGGERSH_HOME` — it is
-> always `~/.diggerssh/` on the remote host, because that is where the server
-> resolves `~` for the login user.
-
----
-
-## How the tunnel works
-
-The forward created is a standard SSH local port forward:
-
-```
-client localhost:9999  ──SSH──▶  server 127.0.0.1:<dest_port>
-```
-
-`ExitOnForwardFailure=yes` makes `ssh` fail fast instead of hanging when the port cannot be bound, and `ServerAliveInterval=30` keeps the tunnel alive through idle periods.
-
 ---
 
 ## Security notes
 
-- Keys are generated **without a passphrase** (as specified for unattended tunnel use). Protect `~/.ssh/` accordingly — it is created with mode `700` and private keys with mode `600`.
-- `StrictHostKeyChecking=accept-new` is used: unknown hosts are accepted and recorded, but **changed** host keys are rejected, so MITM attempts on known hosts still fail.
-- Saved tunnel definitions and the config file are mode `600`.
-- The script never writes your password to disk; it is only passed to `ssh` for the fallback login.
+- Forwards bind the loopback interface only, so they are not exposed to the
+  network.
+- Tunnel records and the config file are written with mode `600`.
+- `StrictHostKeyChecking=accept-new` is used: unknown hosts are accepted on
+  first contact, but a **changed** host key is still rejected. Do not
+  weaken this to `StrictHostKeyChecking=no`.
+- The SSH parameters field is passed to `ssh` unquoted, so it is split into
+  separate arguments. This is intended — it is how `-o` options are supplied
+  — but it means the field must not contain shell metacharacters.
+- `ExitOnForwardFailure=yes` makes `ssh` exit rather than pretend a forward
+  succeeded, which keeps the reported status honest.
 
 ---
 
 ## Contributing
 
-Issues and pull requests are welcome. Please keep the script dependency-free (Bash + `ssh`/`ssh-keygen` only) and run `bash -n diggerssh.sh` before submitting.
+Issues and pull requests are welcome. Please keep the script a single file
+with no hard dependencies beyond `ssh`, and run `bash -n diggerssh.sh`
+before submitting.
+
+---
 
 ## License
 
