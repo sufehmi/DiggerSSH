@@ -224,14 +224,14 @@ save_tunnel() {
   local id="$1" host="$2" user="$3" sport="$4" dport="$5" sshport="$6" key="$7"
   local f="$TUNNEL_DIR/$id.conf"
   {
-    printf 'ID=%s\n' "$id"
-    printf 'HOST=%s\n' "$host"
-    printf 'USER=%s\n' "$user"
-    printf 'SOURCE_PORT=%s\n' "$sport"
-    printf 'DEST_PORT=%s\n' "$dport"
-    printf 'SSH_PORT=%s\n' "$sshport"
-    printf 'KEY=%s\n' "$key"
-    printf 'CREATED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'ID=%q\n' "$id"
+    printf 'HOST=%q\n' "$host"
+    printf 'USER=%q\n' "$user"
+    printf 'SOURCE_PORT=%q\n' "$sport"
+    printf 'DEST_PORT=%q\n' "$dport"
+    printf 'SSH_PORT=%q\n' "$sshport"
+    printf 'KEY=%q\n' "$key"
+    printf 'CREATED=%q\n' "$(date '+%Y-%m-%d %H:%M:%S')"
   } > "$f"
   chmod 600 "$f" 2>/dev/null || true
 }
@@ -260,7 +260,7 @@ try_pubkey_auth() {
       -o ConnectTimeout=10 \
       -o PasswordAuthentication=no \
       -o PreferredAuthentications=publickey \
-      "$user@$host" 'echo __DIGGERSSH_AUTH_OK__' 2>&1)"
+      "$user@$host" 'echo __DIGGERSSH_AUTH_OK__' 2>&1 < /dev/null)"
   [[ "$out" == *"__DIGGERSSH_AUTH_OK__"* ]]
 }
 
@@ -295,6 +295,8 @@ start_tunnel() {
   fi
 
   # ExitOnForwardFailure makes ssh fail fast instead of hanging.
+  # stdin is redirected from /dev/null: ssh would otherwise consume the
+  # script's own stdin and swallow the user's queued menu answers.
   nohup ssh -N -f \
     -p "$sshport" \
     -i "$key" \
@@ -304,7 +306,7 @@ start_tunnel() {
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
     -L "${sport}:127.0.0.1:${dport}" \
-    "$user@$host" > "$logfile" 2>&1
+    "$user@$host" > "$logfile" 2>&1 < /dev/null
 
   sleep 1
   local pid
