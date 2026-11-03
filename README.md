@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.1** — a single-file Bash SSH tunnel manager.
+**v1.8.2** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -30,6 +30,10 @@ holding the port.
   - [Delete a tunnel or server](#delete-a-tunnel-or-server)
 - [The two forwarding directions](#the-two-forwarding-directions)
 - [How status is determined](#how-status-is-determined)
+- [How status is determined](#how-status-is-determined)
+  - [autossh is a supervisor, not the tunnel](#autossh-is-a-supervisor-not-the-tunnel)
+  - [The SSH port](#the-ssh-port)
+  - [Log files](#log-files)
 - [Key exchange fallback](#key-exchange-fallback)
 - [autossh](#autossh)
 - [Post-quantum (ML-DSA-65) support](#post-quantum-ml-dsa-65-support)
@@ -121,7 +125,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.1  SSH tunnel manager
+   v1.8.2  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -302,6 +306,46 @@ so the holder is named up front, with its pid and command line:
 The same `ps` view is printed when a tunnel fails to come up, so the
 cause is visible without leaving the tool.
 
+### autossh is a supervisor, not the tunnel
+
+`autossh` keeps running and respawns `ssh` even when the connection
+fails — wrong port, unreachable host, refused key — and the forward
+argument sits in `autossh`'s **own** command line. So `autossh` alone
+does not prove a tunnel is up.
+
+A tunnel is reported as running only when the `ssh` **child** exists.
+Otherwise a connection that is failing and being retried looks perfectly
+healthy, and the tunnel is reported as up when it is not. When only the
+supervisor is present, the tool says so:
+
+```
+✗ Tunnel did not come up.
+✗   autossh is still retrying (pid 375204), but no ssh connection
+✗   was established — the tunnel is NOT up.
+```
+
+### The SSH port
+
+The port a server listens on for SSH is part of the server record and is
+passed to `ssh` with `-p`. Without it every connection would go to port
+22, and a server registered on another port could never be reached.
+
+A tunnel record carries its own port as well, and **that one wins** — a
+tunnel belongs to a server, but it was created against a particular port.
+
+### Log files
+
+Every entry written to a log file carries a timestamp:
+
+```
+[2026-11-03 22:25:54] Starting tunnel t1: server2.mafindo.or.id:45151 → 127.0.0.1:45151 (-L, ssh port 22)
+[2026-11-03 22:25:56] Tunnel t1 started (pid 376402, -L, kex curve25519-sha256)
+[2026-11-03 22:26:31] Tunnel t1 stopped
+```
+
+The tunnel's own log is the `ssh` process's output, timestamped as it is
+written. The activity log records what the tool did.
+
 The argument is **parsed, not compared as text**. `ssh` accepts many
 spellings of the same forward, and the destination may be any host:port:
 
@@ -474,7 +518,7 @@ command-line line 0: Bad key types '+ssh-mldsa-65'.
 | `~/.diggerssh/servers/<id>.conf` | One file per registered server |
 | `~/.diggerssh/tunnels/<id>.tunnel` | One file per tunnel (`KEY=value` lines) |
 | `~/.diggerssh/tunnels/<id>.log` | Output of that tunnel's `ssh` process |
-| `~/.diggerssh/diggerssh.log` | Script activity log |
+| `~/.diggerssh/diggerssh.log` | Script activity log, one timestamped entry per action |
 
 A server record looks like this:
 

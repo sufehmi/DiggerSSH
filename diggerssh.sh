@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.8.1 — SSH Tunnel Manager
+#  DiggerSSH v1.8.2 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -32,6 +32,21 @@
 #  exit with "Address already in use" and the tunnel would never come up —
 #  so the holder is named up front, with its pid and its command line,
 #  instead of leaving that error to explain.
+#
+#  autossh is a SUPERVISOR: it keeps running and respawning ssh even when
+#  the connection fails, and the forward argument sits in autossh's own
+#  command line. So autossh alone does not prove a tunnel is up — the ssh
+#  CHILD does. A tunnel is reported as running only when that child
+#  exists, otherwise a connection that is failing and being retried would
+#  look perfectly healthy.
+#
+#  The SSH port
+#  ------------
+#  The port a server listens on for SSH is part of the server record and
+#  is passed to ssh with -p. Without it every connection would go to port
+#  22, and a server registered on another port could never be reached.
+#  A tunnel record carries its own port too, and that one wins: a tunnel
+#  belongs to a server, but it was created against a particular port.
 #
 #  Key exchange fallback
 #  ---------------------
@@ -101,6 +116,15 @@
 #  Registering a server from a tunnel menu therefore also creates and
 #  opens the tunnel, rather than leaving a server with no forward.
 #
+#  Logging
+#  -------
+#  Every entry written to a log file carries a timestamp:
+#
+#      [2026-11-03 22:25:56] Tunnel t1 started (pid 376402, -L, kex …)
+#
+#  The tunnel's own log is the ssh process's output, timestamped as it is
+#  written. The activity log records what the tool did.
+#
 #  Orphan tunnels
 #  --------------
 #  A tunnel whose server is not registered is kept and listed, marked
@@ -109,7 +133,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.8.1"
+VERSION="1.8.2"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -132,6 +156,33 @@ info() { printf '%s…%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; }
 ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
 warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+
+# ---------------------------------------------------------------- logging ---
+# A timestamped line, in the form:
+#
+#     [2026-11-03 22:15:54] Tunnel started (pid 1234)
+#
+# Every entry written to a log file carries one, so a log reads as a
+# sequence of events rather than an undated wall of text.
+log_stamp() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+# Append a timestamped entry to the script's activity log.
+log_write() {
+    [[ -f "$LOG_FILE" ]] || return 0
+    log_stamp "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# The awk program that prefixes each line of stdin with a timestamp, so
+# the ssh process's own output is timestamped as it is written to the
+# tunnel's log file.
+#
+# It is a standalone program rather than a shell function on purpose. A
+# shell function is not available inside "bash -c", and a shell loop in a
+# background pipeline does not receive EOF when the writer exits, so the
+# pipeline never finishes and the script hangs waiting for it. awk is a
+# separate process: it ends when its stdin closes, and it inherits no file
+# descriptor from the script, so it cannot hold the terminal open.
+LOG_FILTER_AWK='{ printf "[%s] %s\n", strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }' 
 
 EOF_REACHED=0
 ask() {
@@ -304,6 +355,32 @@ tunnel_pid() {
         printf '%s' "$pid"; return 0
     done < <(tunnel_processes "$sport" "$dir")
     return 1
+}
+
+# The PID of the process that actually HOLDS the tunnel.
+#
+# autossh is a supervisor: it keeps running and respawning ssh even when
+# the connection fails (wrong port, unreachable host, bad key). The forward
+# argument sits in autossh's own command line, so autossh alone would make
+# a dead tunnel look alive. The real worker is the ssh CHILD, and it is
+# the child's presence that proves the connection came up.
+#
+# Prints the ssh pid, or the autossh pid only when no ssh child exists
+# yet (the connection may still be establishing).
+tunnel_worker_pid() {
+    local sport="$1" dport="$2" dir="${3:-}"
+    local pid fdir spec comm supervisor=""
+    while IFS=$'\t' read -r pid fdir spec; do
+        [[ -n "$pid" ]] || continue
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+        if [[ "$comm" == "ssh" ]]; then
+            printf '%s' "$pid"; return 0
+        fi
+        [[ -n "$supervisor" ]] || supervisor="$pid"
+    done < <(tunnel_processes "$sport" "$dir")
+    [[ -n "$supervisor" ]] || return 1
+    printf '%s' "$supervisor"
+    return 1     # only the supervisor: the connection is not up
 }
 
 # Every PID carrying this forward, used when stopping.
@@ -713,12 +790,16 @@ tunnel_menu() {
     fi
     if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= total )); then
         local rec; rec="$(printf '%s\n' "$out" | sed -n "${REPLY}p")"
-        local rslug rsport rdport
-        IFS='|' read -r rslug _ rsport rdport _ _ _ _ _ <<< "$rec"
+        local rslug rsport rdport rtsshport
+        IFS='|' read -r rslug _ rsport rdport _ _ _ rtsshport _ <<< "$rec"
+        # The tunnel record carries its own SSH port; use it, and fall
+        # back to the server's when the record has none. Without this the
+        # connection silently goes to port 22.
+        [[ -n "$rtsshport" ]] || rtsshport="$sshport"
         case "$mode" in
             stop)   stop_tunnel "$rslug" "$host" "$rsport" "$rdport" ;;
-            open-R) open_tunnel "$rslug" "$host" "$user" "$rsport" "$rdport" R "$sshport" ;;
-            open-L) open_tunnel "$rslug" "$host" "$user" "$rsport" "$rdport" L "$sshport" ;;
+            open-R) open_tunnel "$rslug" "$host" "$user" "$rsport" "$rdport" R "$rtsshport" ;;
+            open-L) open_tunnel "$rslug" "$host" "$user" "$rsport" "$rdport" L "$rtsshport" ;;
         esac
         return 1
     fi
@@ -799,6 +880,8 @@ open_tunnel() {
         fi
     fi
 
+    log_write "Starting tunnel $slug: $host:$sport → $TARGET_HOST:$dport (-$dir, ssh port $sshport)"
+
     local -a fwd=( "-$dir" "${bindaddr:+$bindaddr:}${sport}:${TARGET_HOST}:${dport}" )
     # The SSH port must be passed explicitly: ssh would otherwise use 22,
     # and a server registered on another port would never connect. An
@@ -806,26 +889,44 @@ open_tunnel() {
     [[ -n "$sshport" ]] || sshport="$DEFAULT_SSH_PORT"
     [[ "$sshport" =~ ^[0-9]+$ ]] || sshport="$DEFAULT_SSH_PORT"
     # shellcheck disable=SC2086
-    nohup "$TRANSPORT" -N -p "$sshport" $params \
+    # The tunnel's log is ssh's own output. A filter sits between ssh and
+    # the file so every line is stamped with the time it was written.
+    # The tunnel's log is ssh's own output, timestamped as it is written.
+    #
+    # setsid puts the whole thing in a new session: it survives the script
+    # exiting, and it holds no file descriptor of the script, so the
+    # script is never left waiting for it. The awk filter ends when ssh
+    # ends.
+    local cmdline
+    printf -v cmdline '%q ' "$TRANSPORT" -N -p "$sshport" $params \
         -o StrictHostKeyChecking=accept-new \
         -o ExitOnForwardFailure=yes \
         "${algos[@]}" \
-        "${fwd[@]}" "$user@$host" \
-        > "$TUNNEL_DIR/$slug.log" 2>&1 < /dev/null &
+        "${fwd[@]}" "$user@$host"
+    setsid bash -c "$cmdline 2>&1 | awk '$LOG_FILTER_AWK'" \
+        > "$TUNNEL_DIR/$slug.log" 2>/dev/null < /dev/null &
+    disown 2>/dev/null || true
     # Give the connection time to establish. autossh spawns ssh as a child,
-    # so a short window can catch the process before it has bound.
-    local waited=0
-    while (( waited < 12 )); do
-        if tunnel_pid "$sport" "$dport" "$dir" >/dev/null 2>&1; then break; fi
+    # so a short window can catch the process before it has bound. The test
+    # is for the ssh CHILD: autossh exists from the first moment and would
+    # report success for a connection that is failing and being retried.
+    local waited=0 worker=""
+    while (( waited < 15 )); do
+        if worker="$(tunnel_worker_pid "$sport" "$dport" "$dir")"; then
+            [[ "$(cat "/proc/$worker/comm" 2>/dev/null)" == "ssh" ]] && break
+        fi
         sleep 1
         waited=$((waited + 1))
     done
 
-    if pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
+    if pid="$(tunnel_worker_pid "$sport" "$dport" "$dir")" && \
+       [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == "ssh" ]]; then
         if [[ -n "$kexalgo" ]]; then
             ok "Tunnel started (pid $pid) — kex $kexalgo, $host:$sport → local:$TARGET_HOST:$dport"
+            log_write "Tunnel $slug started (pid $pid, -$dir, kex $kexalgo)"
         else
             ok "Tunnel started (pid $pid) — $host:$sport → local:$TARGET_HOST:$dport"
+            log_write "Tunnel $slug started (pid $pid, -$dir)"
         fi
     else
         # A bind failure means the port is already taken. Say so plainly and
@@ -856,6 +957,15 @@ open_tunnel() {
             fi
         else
             err "Tunnel did not come up."
+            log_write "Tunnel $slug did not come up (-$dir, $host:$sport)"
+            # autossh retries a failing connection, so the supervisor may
+            # still be alive while nothing is actually connected. Say so
+            # rather than leaving it looking half-alive.
+            local sup; sup="$(tunnel_worker_pid "$sport" "$dport" "$dir" || true)"
+            if [[ -n "$sup" ]] && [[ "$(cat "/proc/$sup/comm" 2>/dev/null)" == "autossh" ]]; then
+                err "  autossh is still retrying (pid $sup), but no ssh connection"
+                err "  was established — the tunnel is NOT up."
+            fi
             if [[ -n "$log" ]]; then
                 err "  Log:"
                 printf '%s\n' "$log" | sed 's/^/    /'
@@ -907,8 +1017,10 @@ stop_tunnel() {
     sleep 1
     if tunnel_pid "$sport" "$dport" >/dev/null 2>&1; then
         warn "Tunnel $slug is still running — the ssh process did not exit."
+        log_write "Tunnel $slug did not stop cleanly"
     else
         ok "Tunnel $slug stopped."
+        log_write "Tunnel $slug stopped"
     fi
 }
 
@@ -993,6 +1105,7 @@ do_delete() {
         done < <(tunnels_of_server "$sslug")
         rm -f "$SERVER_DIR/$sslug.conf"
         ok "Deleted server $shost and its tunnels."
+        log_write "Deleted server $shost and its tunnels"
         return 0
     fi
 
@@ -1008,6 +1121,7 @@ do_delete() {
         stop_tunnel "$tslug" "$thost" "$tsport" "$tdport" >/dev/null 2>&1 || true
         rm -f "$TUNNEL_DIR/$tslug.tunnel" "$TUNNEL_DIR/$tslug.log"
         ok "Deleted tunnel $thost:$tsport."
+        log_write "Deleted tunnel $thost:$tsport"
         return 0
     fi
 
@@ -1090,6 +1204,7 @@ add_server_form() {
 
     local slug; slug="$(save_server "$host" "$user" "$sshport" "$params" "$desc")"
     ok "Server registered: $user@$host:$sshport"
+    log_write "Server registered: $user@$host:$sshport (${desc:-(no description)})"
     # A tunnel recorded for this server before it was registered becomes
     # visible again now that the server exists.
     attach_orphans "$slug" "$host" "$sshport"
@@ -1133,6 +1248,7 @@ add_tunnel_form() {
     cfg_set LAST_SOURCE_PORT "$sport"
     cfg_set LAST_DEST_PORT "$dport"
     local slug; slug="$(save_tunnel "$sslug" "$host" "$user" "$sport" "$dport" "$sshport" "$params" "$desc")"
+    log_write "Tunnel recorded: $host:$sport → $TARGET_HOST:$dport (-$dir)"
     open_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$dir" "$sshport"
 }
 
@@ -1195,6 +1311,7 @@ init_state() {
     chmod 700 "$DIGGERSH_HOME" 2>/dev/null || true
     [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
     [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE"
+    log_write "=== DiggerSSH v$VERSION started ==="
 }
 
 # A tunnel record whose server is not registered is an ORPHAN. It is kept
