@@ -1,6 +1,8 @@
 # DiggerSSH
 
-**SSH Tunnel Manager** — a single-file Bash script for provisioning and managing SSH port-forward tunnels, with post-quantum (ML-DSA-65) key support where the local OpenSSH build provides it.
+**Tailscale but simple and free.**
+
+An SSH Tunnel Manager — a single-file Bash script for provisioning and managing SSH port-forward tunnels, with post-quantum (ML-DSA-65) key support where the local OpenSSH build provides it.
 
 ```
 ╔══════════════════════════════════════╗
@@ -184,4 +186,4 @@ Issues and pull requests are welcome. Please keep the script dependency-free (Ba
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
