@@ -138,6 +138,37 @@ ssh-keygen -t mldsa-65 -N "" -f ~/.ssh/id_mldsa65
 
 > **Note on the remote side:** the server must also accept the key type. A server running stock OpenSSH older than 10.4 will not accept an ML-DSA key, even if your client supports it. DiggerSSH's fallback chain handles this — it will report the failure and offer the password/manual path.
 
+### The `PubkeyAcceptedAlgorithms` requirement
+
+Merely having an ML-DSA key is not enough. A client only offers a key whose
+signature algorithm appears in its `PubkeyAcceptedAlgorithms` list — and the
+OQS-OpenSSH build knows the standalone ML-DSA algorithms but **does not enable
+them by default**. Without intervention, ssh skips the key with:
+
+```
+debug1: Skipping ssh-mldsa-65 key /home/user/.ssh/id_mldsa65 - corresponding algorithm not in PubkeyAcceptedAlgorithms
+```
+
+DiggerSSH therefore adds the option itself when the local ssh genuinely
+supports it, and prints what it did:
+
+```
+Key type available: ML-DSA-65 (post-quantum)
+SSH algorithms: -o PubkeyAcceptedAlgorithms=+ssh-mldsa-65 -o HostKeyAlgorithms=+ssh-mldsa-65
+```
+
+The check is deliberately conservative, because **stock ssh refuses to start
+if it is asked for an algorithm it has never heard of**:
+
+```
+command-line line 0: Bad key types '+ssh-mldsa-65'.
+```
+
+So the option is only added when `ssh -Q PubkeyAcceptedAlgorithms` lists the
+algorithm *and* it is not already in the effective default. On a stock
+OpenSSH system DiggerSSH therefore prints no algorithm line at all and uses
+Ed25519 as before.
+
 ---
 
 ## Files & layout

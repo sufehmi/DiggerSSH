@@ -254,7 +254,55 @@ list_tunnels() {
   done
 }
 
-# ------------------------------------------------------------- ssh probe ----
+# --------------------------------------------------------------- ssh probe ----
+# Extra ssh options needed to use this key type.
+#
+# A client only offers a key whose signature algorithm is in its
+# PubkeyAcceptedAlgorithms list. The OQS-OpenSSH build knows the
+# standalone ML-DSA algorithms but does NOT enable them by default, so
+# they must be requested explicitly. Stock OpenSSH does not know them at
+# all and refuses to start with "Bad key types" if they are named — so the
+# option is only ever added when the local ssh genuinely supports it.
+#
+# The same applies to the server's host key: a post-quantum-only server
+# needs its host algorithm enabled on the client side too.
+SSH_EXTRA_OPTS=()
+
+build_extra_ssh_opts() {
+  SSH_EXTRA_OPTS=()
+  local algo host_algo
+  case "$KEY_TYPE" in
+    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65"|"mldsa-65")
+      algo="ssh-mldsa-65"
+      host_algo="ssh-mldsa-65" ;;
+    "mldsa-44-ed25519"|"mldsa44-ed25519")
+      algo="ssh-mldsa44-ed25519@openssh.com"
+      host_algo="ssh-mldsa44-ed25519@openssh.com" ;;
+    *)
+      return 0 ;;
+  esac
+
+  local known
+  known="$(ssh -Q PubkeyAcceptedAlgorithms 2>/dev/null)"
+
+  # Enable the signature algorithm if this ssh knows it and it is not
+  # already part of the effective default.
+  if printf '%s\n' "$known" | grep -qxF "$algo" \
+     && ! ssh -G localhost 2>/dev/null \
+          | grep -i '^pubkeyacceptedalgorithms' | grep -qiF "$algo"; then
+    SSH_EXTRA_OPTS+=(-o "PubkeyAcceptedAlgorithms=+$algo")
+  fi
+
+  # Enable the matching host key algorithm, same reasoning.
+  local host_known
+  host_known="$(ssh -Q HostKeyAlgorithms 2>/dev/null)"
+  if printf '%s\n' "$host_known" | grep -qxF "$host_algo" \
+     && ! ssh -G localhost 2>/dev/null \
+          | grep -i '^hostkeyalgorithms' | grep -qiF "$host_algo"; then
+    SSH_EXTRA_OPTS+=(-o "HostKeyAlgorithms=+$host_algo")
+  fi
+}
+
 # Test whether pubkey auth works for host/user/port using the given key.
 # Returns: 0 = key auth OK, 1 = failed
 try_pubkey_auth() {
@@ -267,6 +315,7 @@ try_pubkey_auth() {
       -o ConnectTimeout=10 \
       -o PasswordAuthentication=no \
       -o PreferredAuthentications=publickey \
+      "${SSH_EXTRA_OPTS[@]}" \
       "$user@$host" 'echo __DIGGERSSH_AUTH_OK__' 2>&1 < /dev/null)"
   [[ "$out" == *"__DIGGERSSH_AUTH_OK__"* ]]
 }
@@ -324,6 +373,7 @@ start_tunnel() {
     -o StrictHostKeyChecking=accept-new \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
+    "${SSH_EXTRA_OPTS[@]}" \
     -L "${sport}:127.0.0.1:${dport}" \
     "$user@$host" > "$logfile" 2>&1 < /dev/null
 
@@ -619,6 +669,11 @@ main() {
   # Show what key type this system can use, once, at startup.
   if detect_key_type; then
     printf '%sKey type available:%s %s\n' "$C_CYAN" "$C_RESET" "$(key_type_label)"
+    # Work out whether extra ssh options are needed to use this key type.
+    build_extra_ssh_opts
+    if [[ ${#SSH_EXTRA_OPTS[@]} -gt 0 ]]; then
+      printf '%sSSH algorithms:%s %s\n' "$C_CYAN" "$C_RESET" "${SSH_EXTRA_OPTS[*]}"
+    fi
   else
     warn "Could not determine a usable key type."
   fi
