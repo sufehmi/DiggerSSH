@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.5.1 — SSH Tunnel Manager
+#  DiggerSSH v1.6.0 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -10,14 +10,31 @@
 #         The SERVER listens on the port. Traffic arriving there is carried
 #         down the SSH connection and delivered to 127.0.0.1:<dest> here.
 #
-#           ssh -p <port> <params> -R <sport>:127.0.0.1:<dest> user@host
-#
 #    2) Connect Tunnel (to a server's Port)  →  -L  (local forward)
 #         THIS machine listens on the port and forwards into the server's
 #         port. The local port matches the port the tunnel uses on the
 #         server, so both ends use the same number.
 #
-#           ssh -p <port> <params> -L <sport>:127.0.0.1:<dest> user@host
+#  Key exchange fallback
+#  ---------------------
+#  Some ssh builds (notably OQS-OpenSSH) print
+#
+#      ** WARNING: connection is not using a post-quantum key exchange algorithm.
+#
+#  whenever the negotiated KEX is not post-quantum. That warning is noise on
+#  a server that offers no PQ key exchange at all, and it must not be
+#  mistaken for a failure. DiggerSSH therefore negotiates the KEX explicitly
+#  against the server's advertised list, walking a chain from the strongest
+#  post-quantum option down to ECDH:
+#
+#      level 0  mlkem768x25519-sha256                (post-quantum)
+#      level 1  sntrup761x25519-sha512@openssh.com   (post-quantum hybrid)
+#      level 2  curve25519-sha256                   (classical)
+#      level 3  ecdh-sha2-nistp256                   (classical, ECDH)
+#
+#  The highest level the server actually accepts is used and recorded. The
+#  same chain is applied to the host key and public key algorithms, so the
+#  whole connection degrades together instead of failing at one layer.
 #
 #  Main menu
 #    1) Create Tunnel to Server
@@ -28,11 +45,11 @@
 #
 #  Ownership
 #  ---------
-#  A -R tunnel's listener is on the server, so the local socket table says
-#  nothing about it. Ownership is therefore determined by the local ssh
-#  process that carries the forward argument: that process IS the tunnel. It
-#  is located by matching the exact -L/-R argument in /proc, never with a
-#  broad pkill -f, which can match this script's own shell.
+#  Because a -R tunnel's listener is on the server, the local socket table
+#  says nothing about whether a tunnel is up. Ownership is determined by the
+#  local ssh process that carries the forward argument: that process IS the
+#  tunnel. It is found by matching the -R argument in /proc, never by a broad
+#  pkill -f, which can match this script's own shell.
 #
 #  State layout
 #    ~/.diggerssh/config                 defaults (LAST_HOST, LAST_USER, …)
@@ -42,9 +59,8 @@
 #  The forward target host is fixed at 127.0.0.1 on the far side.
 # ============================================================================
 
-
 set -o pipefail
-VERSION="1.5.1"
+VERSION="1.6.0"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -91,44 +107,21 @@ cfg_set() {
     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
+# Prefer a bundled post-quantum build beside the script.
 if [[ -z "${DIGGERSH_NO_OQS:-}" ]]; then
     _d="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
     if [[ -n "$_d" && -x "$_d/oqs-bin/ssh" ]]; then PATH="$_d/oqs-bin:$PATH"; export PATH; fi
     unset _d
 fi
+SSH_BIN="$(command -v ssh 2>/dev/null || echo ssh)"
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
-# ============================================================ forwards =======
-# The exact argument that identifies a tunnel in an ssh command line.
+# ============================================================ forwarding =====
 forward_spec() {
     local dir="$1" sport="$2" dport="$3"
     printf -- '-%s %s:%s:%s' "$dir" "$sport" "$TARGET_HOST" "$dport"
 }
 
-# PIDs holding a listening socket on $1. ss prints the local address in
-# column 4, e.g. "127.0.0.1:44641" or "[::1]:44641".
-socket_owner_pids() {
-    local port="$1"
-    ss -ltnp 2>/dev/null \
-      | awk -v p="$port" '$4 ~ (":" p "$")' \
-      | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
-}
-
-# Whether a listener on $1 exists in the given address family. A port can be
-# free on one loopback family and busy on the other, so this is asked per
-# family rather than as a single "is it in use" question.
-family_in_use() {
-    local port="$1" family="$2" addr
-    case "$family" in
-        ipv4) addr="127.0.0.1:${port}" ;;
-        ipv6) addr="[::1]:${port}" ;;
-        *) return 1 ;;
-    esac
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$addr"
-}
-
-# The PID of the ssh/autossh process carrying this forward, in either
-# direction. $2 optionally restricts the search to one direction.
 tunnel_pid() {
     local sport="$1" dport="$2" dir="${3:-}"
     local specs=()
@@ -150,7 +143,6 @@ tunnel_pid() {
     return 1
 }
 
-# The direction a running tunnel uses, for display: "L", "R", or "".
 tunnel_dir() {
     local sport="$1" dport="$2" dir
     for dir in L R; do
@@ -168,6 +160,129 @@ status_text() {
     fi
 }
 
+# ============================================================ kex negotiation =
+# The chain, strongest first. "PQ" marks a post-quantum key exchange.
+KEX_CHAIN=(
+    "0|mlkem768x25519-sha256|PQ"
+    "1|sntrup761x25519-sha512@openssh.com|PQ"
+    "1|sntrup761x25519-sha512|PQ"
+    "2|curve25519-sha256|classical"
+    "3|ecdh-sha2-nistp256|classical"
+)
+
+# The host key / public key chain, strongest first.
+HOSTKEY_CHAIN=(
+    "0|ssh-mldsa-65|PQ"
+    "1|ssh-mldsa44-ed25519@openssh.com|PQ"
+    "2|ssh-ed25519|classical"
+    "3|ecdsa-sha2-nistp256|classical"
+)
+
+# The algorithms this client build actually supports.
+client_supports() {
+    local kind="$1" algo="$2"
+    local query
+    case "$kind" in
+        kex)     query="kex" ;;
+        key)     query="key" ;;
+        hostkey) query="key" ;;
+        pubkey)  query="PubkeyAcceptedAlgorithms" ;;
+        *)       return 1 ;;
+    esac
+    "$SSH_BIN" -Q "$query" 2>/dev/null | grep -qxF "$algo"
+}
+
+# The algorithms the server advertises. The KEXINIT exchange prints the
+# server's kex list and its accepted public-key algorithms before any
+# authentication happens, so this works on a first, keyless run.
+server_supports() {
+    local host="$1" user="$2" port="$3" kind="$4"
+    local out
+    out="$(timeout 20 "$SSH_BIN" -v -p "$port" \
+            -o BatchMode=yes -o ConnectTimeout=8 \
+            -o StrictHostKeyChecking=accept-new \
+            "$user@$host" true 2>&1 </dev/null)"
+    case "$kind" in
+        kex)
+            # "debug1: kex_algorithms: a,b,c" lists the server's proposal.
+            printf '%s\n' "$out" | sed -n 's/.*kex_algorithms: //p' | head -1 \
+                | tr ',' '\n' | sed 's/^ *//; s/ *$//' ;;
+        hostkey)
+            # "debug1: kex: host key algorithm: X" is the negotiated one; the
+            # server's full proposal is not printed by every ssh version, so
+            # the accepted host keys are read from the same place the
+            # accepted public keys are.
+            printf '%s\n' "$out" | sed -n 's/.*server-sig-algs=<\([^>]*\)>.*/\1/p' | head -1 \
+                | tr ',' '\n' | sed 's/^ *//; s/ *$//' ;;
+        pubkey)
+            printf '%s\n' "$out" | sed -n 's/.*server-sig-algs=<\([^>]*\)>.*/\1/p' | head -1 \
+                | tr ',' '\n' | sed 's/^ *//; s/ *$//' ;;
+    esac
+}
+
+# Does the server accept this specific KEX? Some ssh versions print only the
+# negotiated algorithm rather than the server's full proposal, so the only
+# reliable test is to try it.
+server_accepts_kex() {
+    local host="$1" user="$2" port="$3" algo="$4"
+    local out
+    out="$(timeout 20 "$SSH_BIN" -p "$port" \
+            -o BatchMode=yes -o ConnectTimeout=8 \
+            -o StrictHostKeyChecking=accept-new \
+            -o "KexAlgorithms=${algo}" \
+            "$user@$host" true 2>&1 </dev/null)"
+    case "$out" in
+        *"no matching key exchange method"*|*"Unable to negotiate"*|*"no match"*) return 1 ;;
+    esac
+    return 0
+}
+
+# Choose the strongest chain entry the CLIENT supports and the SERVER accepts.
+# Prints "level|algo|tag" or nothing if the server advertised nothing usable.
+pick_algorithm() {
+    local host="$1" user="$2" port="$3" kind="$4" chain_name="$5"
+    local -a chain=()
+    case "$chain_name" in
+        kex)     chain=("${KEX_CHAIN[@]}") ;;
+        hostkey) chain=("${HOSTKEY_CHAIN[@]}") ;;
+        pubkey)  chain=("${HOSTKEY_CHAIN[@]}") ;;
+    esac
+    local entry level algo tag
+    for entry in "${chain[@]}"; do
+        IFS='|' read -r level algo tag <<< "$entry"
+        client_supports "$kind" "$algo" || continue
+        if [[ "$kind" == "kex" ]]; then
+            server_accepts_kex "$host" "$user" "$port" "$algo" || continue
+        else
+            local server_list; server_list="$(server_supports "$host" "$user" "$port" "$kind")"
+            [[ -n "$server_list" ]] || continue
+            printf '%s\n' "$server_list" | grep -qxF "$algo" || continue
+        fi
+        printf '%s|%s|%s' "$level" "$algo" "$tag"
+        return 0
+    done
+    return 1
+}
+
+# The ssh options that pin the negotiated algorithms, so a later connection
+# uses exactly what was probed and cannot drift. One "Name=Value" per line.
+algo_opts() {
+    local host="$1" user="$2" port="$3"
+    local pick algo
+    if pick="$(pick_algorithm "$host" "$user" "$port" kex kex)"; then
+        algo="${pick#*|}"; algo="${algo%%|*}"
+        printf 'KexAlgorithms=%s\n' "$algo"
+    fi
+    if pick="$(pick_algorithm "$host" "$user" "$port" hostkey hostkey)"; then
+        algo="${pick#*|}"; algo="${algo%%|*}"
+        printf 'HostKeyAlgorithms=%s\n' "$algo"
+    fi
+    if pick="$(pick_algorithm "$host" "$user" "$port" pubkey pubkey)"; then
+        algo="${pick#*|}"; algo="${algo%%|*}"
+        printf 'PubkeyAcceptedAlgorithms=%s\n' "$algo"
+    fi
+}
+
 # ============================================================ records ========
 slug_of() { printf '%s_%s' "${1//[^a-zA-Z0-9._-]/_}" "$2"; }
 
@@ -175,18 +290,20 @@ list_records() {
     local f
     for f in "$TUNNEL_DIR"/*.tunnel; do
         [[ -f "$f" ]] || continue
-        local slug host user sport dport
+        local slug host user sport dport sshport
         slug="$(basename "$f" .tunnel)"
         host="$(grep -m1 '^HOST='          "$f" | cut -d'=' -f2-)"
         user="$(grep -m1 '^USER='         "$f" | cut -d'=' -f2-)"
         sport="$(grep -m1 '^SOURCE_PORT=' "$f" | cut -d'=' -f2-)"
         dport="$(grep -m1 '^DEST_PORT='   "$f" | cut -d'=' -f2-)"
-        printf '%s|%s|%s|%s|%s\n' "$slug" "$host" "$user" "$sport" "$dport"
+        sshport="$(grep -m1 '^SSH_PORT='   "$f" | cut -d'=' -f2-)"
+        [[ -n "$sshport" ]] || sshport="22"
+        printf '%s|%s|%s|%s|%s|%s\n' "$slug" "$host" "$user" "$sport" "$dport" "$sshport"
     done | sort
 }
 
 save_record() {
-    local host="$1" user="$2" sport="$3" dport="$4" params="$5"
+    local host="$1" user="$2" sport="$3" dport="$4" params="$5" sshport="$6"
     local slug; slug="$(slug_of "$host" "$sport")"
     {
         printf 'ID=%s\n'           "$slug"
@@ -194,6 +311,7 @@ save_record() {
         printf 'USER=%s\n'         "$user"
         printf 'SOURCE_PORT=%s\n'  "$sport"
         printf 'DEST_PORT=%s\n'    "$dport"
+        printf 'SSH_PORT=%s\n'     "$6"
         printf 'SSH_PARAMS=%s\n'   "$params"
         printf 'CREATED=%q\n'      "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$TUNNEL_DIR/$slug.tunnel"
@@ -201,7 +319,6 @@ save_record() {
 }
 
 # ============================================================ submenu ========
-# mode: open-R (create) | open-L (connect) | stop
 submenu() {
     local title="$1" mode="$2"
     local out; out="$(list_records)"
@@ -212,7 +329,7 @@ submenu() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         n=$((n + 1))
-        IFS='|' read -r slug host user sport dport <<< "$line"
+        IFS='|' read -r slug host user sport dport _ <<< "$line"
         printf '  %s%2d%s) %s:%s → %s:%s  %s\n' \
             "$C_BOLD" "$n" "$C_RESET" "$host" "$sport" "$TARGET_HOST" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
@@ -225,7 +342,6 @@ submenu() {
     [[ "$EOF_REACHED" == "1" ]] && return 0
     if [[ "$REPLY" == "0" ]]; then return 0; fi
     if [[ "$REPLY" == "$add" ]]; then
-        # The form needs the direction, not the submenu mode.
         case "$mode" in
             open-R) provisioning_form R ;;
             open-L) provisioning_form L ;;
@@ -236,11 +352,12 @@ submenu() {
     if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= total )); then
         local rec; rec="$(printf '%s\n' "$out" | sed -n "${REPLY}p")"
         local rslug rhost ruser rsport rdport
-        IFS='|' read -r rslug rhost ruser rsport rdport <<< "$rec"
+        local rslug rhost ruser rsport rdport rsshport
+        IFS='|' read -r rslug rhost ruser rsport rdport rsshport <<< "$rec"
         case "$mode" in
             stop)   stop_tunnel "$rslug" "$rhost" "$rsport" "$rdport" ;;
-            open-R) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" R ;;
-            open-L) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" L ;;
+            open-R) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" R "$rsshport" ;;
+            open-L) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" L "$rsshport" ;;
         esac
         return 0
     fi
@@ -250,21 +367,28 @@ submenu() {
 
 # ============================================================ actions =========
 open_tunnel() {
-    local slug="$1" host="$2" user="$3" sport="$4" dport="$5" dir="$6"
+    local slug="$1" host="$2" user="$3" sport="$4" dport="$5" dir="$6" sshport="$7"
     local params; params="$(grep -m1 '^SSH_PARAMS=' "$TUNNEL_DIR/$slug.tunnel" 2>/dev/null | cut -d'=' -f2-)"
 
-    # Already up in this direction?
     local pid
     if pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
         ok "Tunnel $slug is already running (pid $pid, -$dir)."
         return 0
     fi
 
+    # Negotiate the algorithms against this server, once, and reuse them.
+    local -a algo_lines=()
+    mapfile -t algo_lines < <(algo_opts "$host" "$user" "$sshport")
+    local -a algos=()
+    local a kexalgo=""
+    for a in "${algo_lines[@]}"; do
+        [[ -n "$a" ]] || continue
+        algos+=(-o "$a")
+        case "$a" in KexAlgorithms=*) kexalgo="${a#KexAlgorithms=}" ;; esac
+    done
+
     local bindaddr=""
     if [[ "$dir" == "L" ]]; then
-        # A local forward binds HERE, so an occupied port on this side is a
-        # real conflict. ssh binds both loopback families for -L and aborts if
-        # either fails, so bind the free family explicitly.
         if family_in_use "$sport" ipv4 && family_in_use "$sport" ipv6; then
             local other; other="$(socket_owner_pids "$sport" | head -1)"
             warn "Port $sport is held on both IPv4 and IPv6 by another process (pid ${other:-unknown})."
@@ -278,23 +402,21 @@ open_tunnel() {
         fi
     fi
 
-    # ExitOnForwardFailure makes ssh exit loudly if the forward cannot be
-    # established, instead of pretending to succeed.
-    # The forward is two separate arguments: "-L"/"-R", then the spec.
     local -a fwd=( "-$dir" "${bindaddr:+$bindaddr:}${sport}:${TARGET_HOST}:${dport}" )
     # shellcheck disable=SC2086
     nohup "$TRANSPORT" -N $params \
         -o StrictHostKeyChecking=accept-new \
         -o ExitOnForwardFailure=yes \
+        "${algos[@]}" \
         "${fwd[@]}" "$user@$host" \
         > "$TUNNEL_DIR/$slug.log" 2>&1 < /dev/null &
     sleep 3
 
     if pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
-        if [[ "$dir" == "R" ]]; then
-            ok "Tunnel started (pid $pid) — $host:$sport → local:$TARGET_HOST:$dport  (-R)"
+        if [[ -n "$kexalgo" ]]; then
+            ok "Tunnel started (pid $pid) — kex $kexalgo, $host:$sport → local:$TARGET_HOST:$dport"
         else
-            ok "Tunnel started (pid $pid) — local:$sport → $host:$dport  (-L)"
+            ok "Tunnel started (pid $pid) — $host:$sport → local:$TARGET_HOST:$dport"
         fi
     else
         err "Tunnel did not come up. Log:"
@@ -310,8 +432,6 @@ stop_tunnel() {
         warn "Tunnel $slug is not running."
         return 0
     fi
-    # autossh supervises an ssh child; kill the supervisor first so it does
-    # not resurrect the child, then the child itself.
     local parent; parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
     kill "$pid" 2>/dev/null || true
     if [[ -n "$parent" && "$parent" != "1" ]]; then
@@ -319,7 +439,6 @@ stop_tunnel() {
         [[ "$pcomm" == "autossh" ]] && kill "$parent" 2>/dev/null || true
     fi
     sleep 1
-    # Any remaining process still carrying this forward.
     local p cmd spec
     for spec in "$(forward_spec L "$sport" "$dport")" "$(forward_spec R "$sport" "$dport")"; do
         for p in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
@@ -350,14 +469,13 @@ do_list() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         n=$((n + 1))
-        IFS='|' read -r slug host user sport dport <<< "$line"
+        IFS='|' read -r slug host user sport dport _ <<< "$line"
         printf '  %-4s %-18s %-9s %-9s %s\n' "$n" "$host" "$sport" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
     return 0
 }
 
 # ============================================================ provisioning ===
-# $1 is the direction the new tunnel will use.
 provisioning_form() {
     local dir="${1:-R}"
     printf '\n%s── Add New Server ──%s\n' "$C_BOLD" "$C_CYAN"
@@ -398,9 +516,9 @@ provisioning_form() {
     cfg_set LAST_SSH_PORT "$sshport"
     cfg_set LAST_SOURCE_PORT "$sport"
     cfg_set LAST_DEST_PORT "$dport"
-    save_record "$host" "$user" "$sport" "$dport" "$params"
+    save_record "$host" "$user" "$sport" "$dport" "$params" "$sshport"
     local slug; slug="$(slug_of "$host" "$sport")"
-    open_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$dir"
+    open_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$dir" "$sshport"
 }
 
 # ------------------------------------------------------------------ menu ----
@@ -435,6 +553,24 @@ print_banner_body() {
     printf '  %s3%s) List tunnels\n'                       "$C_GREEN" "$C_RESET"
     printf '  %s4%s) Stop a tunnel\n'                     "$C_YELLOW" "$C_RESET"
     printf '  %s0%s) Exit\n\n'                            "$C_RED"   "$C_RESET"
+}
+
+# PIDs holding a listening socket on $1.
+socket_owner_pids() {
+    local port="$1"
+    ss -ltnp 2>/dev/null | awk -v p="$port" '$4 ~ (":" p "$")' \
+      | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+}
+
+# Whether a listener on $1 exists in the given address family.
+family_in_use() {
+    local port="$1" family="$2" addr
+    case "$family" in
+        ipv4) addr="127.0.0.1:${port}" ;;
+        ipv6) addr="[::1]:${port}" ;;
+        *) return 1 ;;
+    esac
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$addr"
 }
 
 init_state() {
