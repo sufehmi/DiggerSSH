@@ -173,14 +173,18 @@ pubkey_path() {
 ensure_key() {
   detect_key_type || { err "No usable key type found in this ssh-keygen."; return 1; }
 
-  local pub; pub="$(pubkey_path)"
-  local priv="${pub}"
+  local priv pub
+  priv="$(pubkey_path)"     # e.g. ~/.ssh/id_mldsa65      (private key)
+  pub="${priv}.pub"         # e.g. ~/.ssh/id_mldsa65.pub  (public key)
 
   # If a key of the right type already exists, reuse it.
   if [[ -f "$priv" && -f "$pub" ]]; then
     local existing_type
     existing_type="$(ssh-keygen -l -f "$pub" 2>/dev/null | awk '{print $4}')"
     if [[ -n "$existing_type" ]] && key_matches_type "$existing_type"; then
+      # Repair permissions: ssh refuses to use a private key that is
+      # group/world readable, so make sure it is locked down.
+      chmod 600 "$priv" 2>/dev/null || true
       ok "Using existing key: $(basename "$pub") ($(key_type_label))"
       return 0
     fi
@@ -268,16 +272,28 @@ try_pubkey_auth() {
 # interactive password login. Returns 0 on success.
 install_pubkey_remote() {
   local host="$1" user="$2" sshport="$3" key="$4" pub="$5"
-  local pubdata
-  pubdata="$(cat "$pub")"
 
   info "Authenticating with password to install the public key..."
-  ssh -p "$sshport" \
+
+  # One ssh invocation, one password prompt. The public key is piped in on
+  # stdin and never interpolated into the remote command line, so it is
+  # immune to shell-quoting problems. The remote side appends it only if
+  # it is not already present.
+  if ssh -p "$sshport" \
       -o StrictHostKeyChecking=accept-new \
       -o ConnectTimeout=15 \
       -o PreferredAuthentications=password,keyboard-interactive \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=3 \
       "$user@$host" \
-      "umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && grep -qF '$pubdata' ~/.ssh/authorized_keys || printf '%s\n' '$pubdata' >> ~/.ssh/authorized_keys"
+      'umask 077; mkdir -p ~/.ssh && t=$(mktemp) && cat > "$t" && \
+       if grep -qxFf "$t" ~/.ssh/authorized_keys 2>/dev/null; then rm -f "$t"; \
+       else cat "$t" >> ~/.ssh/authorized_keys; rm -f "$t"; fi; \
+       chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys' \
+      < "$pub"; then
+    return 0
+  fi
+  return 1
 }
 
 # --------------------------------------------------------------- tunnels ----
