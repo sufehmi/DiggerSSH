@@ -118,7 +118,7 @@ Rather than hard-coding a key type that would fail on most systems, DiggerSSH **
 |---|---|---|
 | 1 | `ml-dsa-65` | Standalone ML-DSA-65 |
 | 2 | `ssh-mldsa-65` | Standalone ML-DSA-65 (alternate spelling) |
-| 3 | `mldsa65` | Standalone ML-DSA-65 (alternate spelling) |
+| 3 | `mldsa65` | Standalone ML-DSA-65 (OQS-OpenSSH fork) |
 | 4 | `mldsa-44-ed25519` | Upstream OpenSSH 10.4+ composite |
 | 5 | `mldsa44-ed25519` | Upstream OpenSSH 10.4+ composite |
 | 6 | `ed25519` | Universal fallback |

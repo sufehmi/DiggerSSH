@@ -136,7 +136,7 @@ ssh_keygen_supports() {
 
 detect_key_type() {
   # Probe candidates in order of preference.
-  local candidates=("ml-dsa-65" "ssh-mldsa-65" "mldsa65" "mldsa-44-ed25519" "mldsa44-ed25519" "ed25519")
+  local candidates=("ml-dsa-65" "ssh-mldsa-65" "mldsa65" "mldsa-65" "mldsa-44-ed25519" "mldsa44-ed25519" "ed25519")
   local c
   for c in "${candidates[@]}"; do
     if ssh_keygen_supports "$c"; then
@@ -151,7 +151,7 @@ detect_key_type() {
 # Human label for the active key type
 key_type_label() {
   case "$KEY_TYPE" in
-    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65") printf 'ML-DSA-65 (post-quantum)' ;;
+    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65"|"mldsa-65") printf 'ML-DSA-65 (post-quantum)' ;;
     "mldsa-44-ed25519"|"mldsa44-ed25519")   printf 'ML-DSA-44 + Ed25519 (post-quantum composite)' ;;
     "ed25519")                             printf 'Ed25519' ;;
     *)                                     printf '%s' "${KEY_TYPE:-unknown}" ;;
@@ -161,7 +161,7 @@ key_type_label() {
 # Public key file for the active type
 pubkey_path() {
   case "$KEY_TYPE" in
-    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65") printf '%s' "$PREF_KEY" ;;
+    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65"|"mldsa-65") printf '%s' "$PREF_KEY" ;;
     "mldsa-44-ed25519"|"mldsa44-ed25519") printf '%s' "$SSH_DIR/id_mldsa44_ed25519" ;;
     "ed25519")                             printf '%s' "$SSH_DIR/id_ed25519" ;;
     *)                                     printf '%s' "$PREF_KEY" ;;
@@ -205,11 +205,14 @@ ensure_key() {
 }
 
 # Does an ssh-keygen fingerprint label correspond to the active KEY_TYPE?
+# Fingerprint labels are the short names, e.g. "MLDSA-65", "MLDSA44-ED25519",
+# "ED25519" — note they are hyphenated, not "ML-DSA-65".
 key_matches_type() {
   local label="$1"
+  label="${label^^}"   # uppercase for a case-insensitive compare
   case "$KEY_TYPE" in
-    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65")
-      [[ "$label" == *"ML-DSA-65"* || "$label" == *"MLDSA65"* || "$label" == *"ML-DSA-65"* ]] ;;
+    "ml-dsa-65"|"ssh-mldsa-65"|"mldsa65"|"mldsa-65")
+      [[ "$label" == *"MLDSA-65"* || "$label" == *"ML-DSA-65"* ]] ;;
     "mldsa-44-ed25519"|"mldsa44-ed25519")
       [[ "$label" == *"MLDSA44"* || "$label" == *"ML-DSA-44"* ]] ;;
     "ed25519")
