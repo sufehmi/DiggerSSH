@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.7.0** — a single-file Bash SSH tunnel manager.
+**v1.8.0** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -27,6 +27,7 @@ holding the port.
   - [Connect Tunnel (to a server's Port)](#connect-tunnel-to-a-servers-port)
   - [List tunnels](#list-tunnels)
   - [Stop a tunnel](#stop-a-tunnel)
+  - [Delete a tunnel or server](#delete-a-tunnel-or-server)
 - [The two forwarding directions](#the-two-forwarding-directions)
 - [How status is determined](#how-status-is-determined)
 - [Key exchange fallback](#key-exchange-fallback)
@@ -120,18 +121,33 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.5.1  SSH tunnel manager
+   v1.8.0  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
   3) List tunnels
   4) Stop a tunnel
+  5) Delete a tunnel or server
   0) Exit
 ```
 
-Each of the first four entries opens a submenu listing your tunnels, with
-`+ Add new server` and `Exit to main menu` as the final entries. `List
-tunnels` is a plain report and returns to the main menu immediately.
+The first two menus are **two-tier**: pick a **server**, then one of that
+server's **tunnels**. The server list comes from `~/.diggerssh/servers/`,
+so deleting a server's file removes it from the menus — and its tunnels
+go with it.
+
+| Entry | What it does |
+|---|---|
+| `+ Add new server` | Asks for host, username, SSH port, description and SSH parameters; saves one file in `~/.diggerssh/servers/` |
+| `+ Create tunnel on this server` | Asks for the source and destination ports; saves one file in `~/.diggerssh/tunnels/` |
+
+A tunnel whose server is not registered is kept and listed, marked
+`(no server)`, but it does not appear under any server. Registering the
+server again re-attaches it.
+
+`List tunnels` is a plain report. `Delete a tunnel or server` lists both
+kinds of record in one continuous numbering and removes the chosen one,
+stopping the tunnel first if it is running.
 
 ### Create Tunnel to Server
 
@@ -192,6 +208,15 @@ Lists your tunnels, asks which one to terminate, and kills the `ssh` process
 carrying that forward. The `autossh` supervisor is killed before its `ssh`
 child so it cannot resurrect the tunnel.
 
+### Delete a tunnel or server
+
+Lists the servers and the tunnels in one continuous numbering and removes the
+one you pick. A running tunnel is stopped first, so deleting a record never
+leaves an orphaned `ssh` process behind.
+
+Deleting a **server** removes its tunnels with it — that is how you start
+over: delete the server, and both menus are empty again.
+
 ---
 
 ## The two forwarding directions
@@ -243,8 +268,27 @@ carries the forward argument **is** the tunnel, so DiggerSSH finds it by
 parsing that argument out of `/proc`:
 
 ```bash
-pgrep -x ssh; pgrep -x autossh      # then parse the -L/-R argument in /proc/PID/cmdline
+ps auxw | grep 44641                # the same view the tool uses
 ```
+
+`ps` enumerates the processes and the `-L`/`-R` argument is parsed out of
+each `ssh`/`autossh` command line. The **source port** identifies the
+tunnel; the destination may be any `host:port`, and the bind address may
+be spelled several ways, so neither is compared.
+
+Before a tunnel is started the port is checked the same way. An `ssh`
+process already carrying that port cannot be bound again — `ssh` would
+exit with `Address already in use` and the tunnel would never come up —
+so the holder is named up front, with its pid and command line:
+
+```
+! Port 44641 is already carried by an ssh process (pid 363872, -L [::1]:44641:127.0.0.1:44641).
+!   ps auxw | grep 44641:
+    sufehmi 363872 /usr/bin/ssh -N ... -L [::1]:44641:127.0.0.1:44641 user@host
+```
+
+The same `ps` view is printed when a tunnel fails to come up, so the
+cause is visible without leaving the tool.
 
 The argument is **parsed, not compared as text**. `ssh` accepts many
 spellings of the same forward, and the destination may be any host:port:
@@ -415,14 +459,28 @@ command-line line 0: Bad key types '+ssh-mldsa-65'.
 | Path | Purpose |
 |---|---|
 | `~/.diggerssh/config` | Last-used host, username, ports |
+| `~/.diggerssh/servers/<id>.conf` | One file per registered server |
 | `~/.diggerssh/tunnels/<id>.tunnel` | One file per tunnel (`KEY=value` lines) |
 | `~/.diggerssh/tunnels/<id>.log` | Output of that tunnel's `ssh` process |
 | `~/.diggerssh/diggerssh.log` | Script activity log |
 
-A tunnel record looks like this:
+A server record looks like this:
+
+```
+ID=server2.mafindo.or.id_22
+HOST=server2.mafindo.or.id
+USER=sufehmi
+SSH_PORT=22
+SSH_PARAMS=-o ServerAliveInterval=30 -o ServerAliveCountMax=5
+DESCRIPTION=Production DB access
+CREATED=2026-11-03 19:15:29
+```
+
+and a tunnel record like this:
 
 ```
 ID=server2.mafindo.or.id_44641
+SERVER=server2.mafindo.or.id_22
 DESCRIPTION=Production DB access
 HOST=server2.mafindo.or.id
 USER=sufehmi
