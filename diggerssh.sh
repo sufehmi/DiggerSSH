@@ -183,9 +183,26 @@ open_record() {
 }
 
 # ============================================================ actions =========
+# List is a plain report: print the table and return to the main menu.
+# Create, Connect and Stop are action menus: they list, then ask which one.
+do_list() {
+    printf '\n%s── List tunnels ──%s\n' "$C_BOLD" "$C_CYAN"
+    local out; out="$(list_records)"
+    if [[ -z "$out" ]]; then info "No tunnels registered."; return 0; fi
+    printf '  %-4s %-16s %-10s %-10s %s\n' "#" "HOST" "SOURCE" "DEST" "STATUS"
+    printf '  %-4s %-16s %-10s %-10s %s\n' "---" "----" "------" "----" "------"
+    local n=0 line slug host user sport dport
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        n=$((n + 1))
+        IFS='|' read -r slug host user sport dport <<< "$line"
+        printf '  %-4s %-16s %-10s %-10s %s\n' "$n" "$host" "$sport" "$dport" "$(status_of "$slug")"
+    done <<< "$out"
+    return 0
+}
+
 do_create() { submenu "Create Tunnel to Server"; }
 do_connect() { submenu "Connect Tunnel (to a server's Port)"; }
-do_list()    { submenu "List tunnels"; }
 do_stop()    { submenu "Stop a tunnel"; }
 
 # ============================================================ provisioning ===
