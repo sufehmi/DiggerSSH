@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.6.1 — SSH Tunnel Manager
+#  DiggerSSH v1.7.0 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -48,8 +48,16 @@
 #  Because a -R tunnel's listener is on the server, the local socket table
 #  says nothing about whether a tunnel is up. Ownership is determined by the
 #  local ssh process that carries the forward argument: that process IS the
-#  tunnel. It is found by matching the -R argument in /proc, never by a broad
-#  pkill -f, which can match this script's own shell.
+#  tunnel. It is found by PARSING that argument out of /proc, never by a
+#  broad pkill -f, which can match this script's own shell.
+#
+#  The argument is parsed rather than compared as text, because ssh accepts
+#  many spellings of the same forward ("-L 44641:...", "-L [::1]:44641:...",
+#  "-L 0.0.0.0:44641:...") and the destination may be any host:port. A
+#  whole-string comparison misses tunnels that are plainly running, which
+#  makes the status read "stopped" and a later start collide with the live
+#  tunnel. The source port identifies the tunnel; the destination does not
+#  have to match the record.
 #
 #  State layout
 #    ~/.diggerssh/config                 defaults (LAST_HOST, LAST_USER, …)
@@ -60,7 +68,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.6.1"
+VERSION="1.7.0"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -117,45 +125,130 @@ SSH_BIN="$(command -v ssh 2>/dev/null || echo ssh)"
 command -v autossh >/dev/null 2>&1 && TRANSPORT="autossh" || TRANSPORT="ssh"
 
 # ============================================================ forwarding =====
-# The forward spec as it appears in an ssh command line. The bind address is
-# optional: ssh accepts "-L port:host:port" and "-L [::1]:port:host:port" as
-# equivalent, and the second form is used when one loopback family is
-# already taken. A matcher that only knows the first form would report a
-# running tunnel as stopped, and a later start would then collide with it.
-forward_spec() {
-    local dir="$1" sport="$2" dport="$3"
-    printf -- '-%s %s:%s:%s' "$dir" "$sport" "$TARGET_HOST" "$dport"
+# Matching a tunnel to a record must not depend on the exact text of the
+# forward argument. ssh accepts many spellings of the same forward:
+#
+#   -L 44641:127.0.0.1:44641              plain
+#   -L 127.0.0.1:44641:127.0.0.1:44641     explicit IPv4 bind
+#   -L [::1]:44641:127.0.0.1:44641         explicit IPv6 bind
+#   -L [::]:44641:127.0.0.1:44641          IPv6 wildcard bind
+#   -L 0.0.0.0:44641:127.0.0.1:44641       IPv4 wildcard bind
+#   -L *:44641:127.0.0.1:44641             star bind
+#
+# and the destination may be any host:port, not necessarily 127.0.0.1.
+#
+# A whole-string comparison therefore misses tunnels that are plainly
+# running: the status reads "stopped", a later start then collides with
+# the live tunnel, and the user is told the port is already in use.
+#
+# Instead each -L/-R argument in a process's command line is PARSED, and
+# the tunnel is identified by the pair (direction, source port). The
+# destination is compared only when the record knows one and the argument
+# names a different one.
+
+# Pull every forward argument out of a command line, one per line, with
+# the direction and the argument separated by a tab.
+parse_forwards() {
+    local cmd="$1"
+    local -a words=()
+    local i
+    # shellcheck disable=SC2206
+    words=( $cmd )
+    for (( i = 0; i < ${#words[@]}; i++ )); do
+        case "${words[i]}" in
+            -L|-R)
+                (( i + 1 < ${#words[@]} )) || continue
+                printf '%s\t%s\n' "${words[i]#-}" "${words[i+1]}"
+                ;;
+            -L*|-R*)
+                # "-L44641:..." — the value is glued to the flag
+                printf '%s\t%s\n' "${words[i]#[-]L}" "${words[i]#[-]R}"
+                ;;
+        esac
+    done
 }
 
-# The set of specs that identify a tunnel in an ssh command line: the plain
-# form and the bind-address forms.
-forward_specs() {
-    local dir="$1" sport="$2" dport="$3"
-    printf -- '-%s %s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
-    printf -- '-%s 127.0.0.1:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
-    printf -- '-%s [::1]:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
-    printf -- '-%s [::]:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
-    printf -- '-%s 0.0.0.0:%s:%s:%s\n' "$dir" "$sport" "$TARGET_HOST" "$dport"
+# Split a forward argument into its fields. A forward is
+#
+#   [bind_address:]port:host:hostport
+#
+# where the bind address is optional and may be "[::1]", "127.0.0.1",
+# "0.0.0.0", "[::]" or "*". The fields are separated by colons, but a
+# bracketed IPv6 address contains colons of its own, so a bracketed
+# address is stripped out first and kept as a single field.
+#
+# Sets FWD_FIELDS to: bind, port, host, hostport.
+forward_split() {
+    local spec="$1" bind=""
+    FWD_FIELDS=()
+    case "$spec" in
+        \[*\]:*) bind="${spec%%]:*}"; spec="${spec#*]:}" ;;
+    esac
+
+    # Split the remainder on colons.
+    local -a f=()
+    local IFS=':'
+    read -r -a f <<< "$spec"
+    unset IFS
+
+    case "${#f[@]}" in
+        4)  FWD_FIELDS=( "${f[0]}" "${f[1]}" "${f[2]}" "${f[3]}" ) ;;
+        3)  FWD_FIELDS=( "$bind" "${f[0]}" "${f[1]}" "${f[2]}" ) ;;
+        *)  FWD_FIELDS=( "$bind" "${f[0]:-}" "" "" ) ;;
+    esac
 }
 
+# The source port of a forward argument.
+forward_source_port() {
+    forward_split "$1"
+    printf '%s' "${FWD_FIELDS[1]}"
+}
+
+# The destination "host:port" of a forward argument, or empty.
+forward_dest() {
+    forward_split "$1"
+    [[ -n "${FWD_FIELDS[2]}" ]] && printf '%s:%s' "${FWD_FIELDS[2]}" "${FWD_FIELDS[3]}"
+}
+
+# The PID of the ssh/autossh process carrying this forward, if any.
+# $1 source port, $2 destination port (may be empty), $3 direction (L or R,
+# empty for either).
 tunnel_pid() {
     local sport="$1" dport="$2" dir="${3:-}"
-    local -a specs=()
-    if [[ -n "$dir" ]]; then
-        mapfile -t specs < <(forward_specs "$dir" "$sport" "$dport")
-    else
-        mapfile -t specs < <(forward_specs L "$sport" "$dport"; forward_specs R "$sport" "$dport")
-    fi
-    local pid cmd spec
+    local pid cmd line fdir spec fport fdest
     for pid in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
         [[ "$pid" == "$$" ]] && continue
         [[ -r "/proc/$pid/cmdline" ]] || continue
         cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-        for spec in "${specs[@]}"; do
-            [[ "$cmd" == *"$spec"* ]] && { printf '%s' "$pid"; return 0; }
-        done
+        while IFS=$'\t' read -r fdir spec; do
+            [[ -n "$fdir" && -n "$spec" ]] || continue
+            [[ -n "$dir" && "$fdir" != "$dir" ]] && continue
+            fport="$(forward_source_port "$spec")"
+            [[ "$fport" == "$sport" ]] || continue
+            # The source port identifies the tunnel. The destination is not
+            # required to match: ssh permits any host:port there, and a
+            # mismatch must not make a running tunnel look stopped.
+            printf '%s' "$pid"; return 0
+        done < <(parse_forwards "$cmd")
     done
     return 1
+}
+
+# Every PID carrying this forward, used when stopping.
+tunnel_pids() {
+    local sport="$1" dport="$2"
+    local pid cmd line fdir spec fport fdest
+    for pid in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
+        [[ "$pid" == "$$" ]] && continue
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+        while IFS=$'\t' read -r fdir spec; do
+            [[ -n "$fdir" && -n "$spec" ]] || continue
+            fport="$(forward_source_port "$spec")"
+            [[ "$fport" == "$sport" ]] || continue
+            printf '%s\n' "$pid"
+        done < <(parse_forwards "$cmd")
+    done | sort -u
 }
 
 tunnel_dir() {
@@ -298,6 +391,17 @@ algo_opts() {
     fi
 }
 
+# A description is stored in full but only ever shown shortened, so the
+# listing stays a fixed width. 19 characters plus an ellipsis is 20.
+trunc_desc() {
+    local s="$1"
+    if (( ${#s} > 20 )); then
+        printf '%s…' "${s:0:19}"
+    else
+        printf '%s' "$s"
+    fi
+}
+
 # ============================================================ records ========
 slug_of() { printf '%s_%s' "${1//[^a-zA-Z0-9._-]/_}" "$2"; }
 
@@ -305,7 +409,7 @@ list_records() {
     local f
     for f in "$TUNNEL_DIR"/*.tunnel; do
         [[ -f "$f" ]] || continue
-        local slug host user sport dport sshport
+        local slug host user sport dport sshport desc
         slug="$(basename "$f" .tunnel)"
         host="$(grep -m1 '^HOST='          "$f" | cut -d'=' -f2-)"
         user="$(grep -m1 '^USER='         "$f" | cut -d'=' -f2-)"
@@ -313,15 +417,17 @@ list_records() {
         dport="$(grep -m1 '^DEST_PORT='   "$f" | cut -d'=' -f2-)"
         sshport="$(grep -m1 '^SSH_PORT='   "$f" | cut -d'=' -f2-)"
         [[ -n "$sshport" ]] || sshport="22"
-        printf '%s|%s|%s|%s|%s|%s\n' "$slug" "$host" "$user" "$sport" "$dport" "$sshport"
+        desc="$(grep -m1 '^DESCRIPTION=' "$f" | cut -d'=' -f2-)"
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$slug" "$host" "$user" "$sport" "$dport" "$sshport" "$desc"
     done | sort
 }
 
 save_record() {
-    local host="$1" user="$2" sport="$3" dport="$4" params="$5" sshport="$6"
+    local host="$1" user="$2" sport="$3" dport="$4" params="$5" sshport="$6" desc="$7"
     local slug; slug="$(slug_of "$host" "$sport")"
     {
         printf 'ID=%s\n'           "$slug"
+        printf 'DESCRIPTION=%s\n'  "$desc"
         printf 'HOST=%s\n'         "$host"
         printf 'USER=%s\n'         "$user"
         printf 'SOURCE_PORT=%s\n'  "$sport"
@@ -344,7 +450,7 @@ submenu() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         n=$((n + 1))
-        IFS='|' read -r slug host user sport dport _ <<< "$line"
+        IFS='|' read -r slug host user sport dport _ desc <<< "$line"
         printf '  %s%2d%s) %s:%s → %s:%s  %s\n' \
             "$C_BOLD" "$n" "$C_RESET" "$host" "$sport" "$TARGET_HOST" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
@@ -368,7 +474,7 @@ submenu() {
         local rec; rec="$(printf '%s\n' "$out" | sed -n "${REPLY}p")"
         local rslug rhost ruser rsport rdport
         local rslug rhost ruser rsport rdport rsshport
-        IFS='|' read -r rslug rhost ruser rsport rdport rsshport <<< "$rec"
+        IFS='|' read -r rslug rhost ruser rsport rdport rsshport rdesc <<< "$rec"
         case "$mode" in
             stop)   stop_tunnel "$rslug" "$rhost" "$rsport" "$rdport" ;;
             open-R) open_tunnel "$rslug" "$rhost" "$ruser" "$rsport" "$rdport" R "$rsshport" ;;
@@ -439,18 +545,26 @@ open_tunnel() {
         local log; log="$(cat "$TUNNEL_DIR/$slug.log" 2>/dev/null)"
         if printf '%s' "$log" | grep -qi "address already in use"; then
             err "Port $sport is already in use — the tunnel could not bind."
+            # ss -p only names sockets you own, so a tunnel running as
+            # another user shows no pid there even though /proc exposes its
+            # command line. Look in both places.
             local holder; holder="$(socket_owner_pids "$sport" | head -1)"
+            if [[ -z "$holder" ]]; then
+                holder="$(tunnel_pids "$sport" "" | head -1)"
+            fi
             if [[ -n "$holder" ]]; then
                 local hcomm; hcomm="$(cat "/proc/$holder/comm" 2>/dev/null)"
                 err "  held by $hcomm (pid $holder)"
                 if [[ "$hcomm" == "ssh" || "$hcomm" == "autossh" ]]; then
-                    err "  that looks like a tunnel DiggerSSH did not recognise —"
-                    err "  try 'Stop a tunnel', or stop it manually: kill $holder"
+                    err "  that is an SSH tunnel already forwarding port $sport."
+                    err "  It is not one of the tunnels DiggerSSH tracks, so it was"
+                    err "  not started here. Stop it manually: kill $holder"
                 else
                     err "  it is not an ssh tunnel — free the port and retry."
                 fi
             else
-                err "  the holder is not a local process (it may be bound on the server)."
+                err "  no local process owns it; the port is probably bound"
+                err "  on the server side of an -R tunnel."
             fi
         else
             err "Tunnel did not come up. Log:"
@@ -474,13 +588,15 @@ stop_tunnel() {
         [[ "$pcomm" == "autossh" ]] && kill "$parent" 2>/dev/null || true
     fi
     sleep 1
-    local p cmd spec
-    for spec in $(forward_specs L "$sport" "$dport"; forward_specs R "$sport" "$dport"); do
-        for p in $(pgrep -x ssh 2>/dev/null; pgrep -x autossh 2>/dev/null); do
-            [[ -r "/proc/$p/cmdline" ]] || continue
-            cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
-            [[ "$cmd" == *"$spec"* ]] && kill "$p" 2>/dev/null || true
-        done
+    # Any process still carrying this forward, in either direction.
+    local p parent2
+    for p in $(tunnel_pids "$sport" "$dport"); do
+        kill "$p" 2>/dev/null || true
+        parent2="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        if [[ -n "$parent2" && "$parent2" != "1" ]]; then
+            local pc2; pc2="$(cat "/proc/$parent2/comm" 2>/dev/null)"
+            [[ "$pc2" == "autossh" ]] && kill "$parent2" 2>/dev/null || true
+        fi
     done
     sleep 1
     if tunnel_pid "$sport" "$dport" >/dev/null 2>&1; then
@@ -498,14 +614,14 @@ do_list() {
     printf '\n%s── List tunnels ──%s\n' "$C_BOLD" "$C_CYAN"
     local out; out="$(list_records)"
     if [[ -z "$out" ]]; then info "No tunnels registered."; return 0; fi
-    printf '  %-4s %-18s %-9s %-9s %s\n' "#" "HOST" "PORT" "LOCAL" "STATUS"
-    printf '  %-4s %-18s %-9s %-9s %s\n' "---" "----" "----" "-----" "------"
-    local n=0 line slug host user sport dport
+    printf '  %-20s %-4s %-18s %-9s %-9s %s\n' "DESCRIPTION" "#" "HOST" "PORT" "LOCAL" "STATUS"
+    printf '  %-20s %-4s %-18s %-9s %-9s %s\n' "----------" "---" "----" "----" "-----" "------"
+    local n=0 line slug host user sport dport desc
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         n=$((n + 1))
-        IFS='|' read -r slug host user sport dport _ <<< "$line"
-        printf '  %-4s %-18s %-9s %-9s %s\n' "$n" "$host" "$sport" "$dport" "$(status_text "$sport" "$dport")"
+        IFS='|' read -r slug host user sport dport _ desc <<< "$line"
+        printf '  %-20s %-4s %-18s %-9s %-9s %s\n' "$(trunc_desc "$desc")" "$n" "$host" "$sport" "$dport" "$(status_text "$sport" "$dport")"
     done <<< "$out"
     return 0
 }
@@ -525,7 +641,11 @@ provisioning_form() {
     [[ "$EOF_REACHED" == "1" ]] && return 1
     ask "SSH Port" "$DEFAULT_SSH_PORT"; local sshport="$REPLY"
 
-    printf '\n%sStep 2 — Tunnel%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n%sStep 2 — Description%s\n' "$C_BOLD" "$C_RESET"
+    ask "Description" ""; local desc="$REPLY"
+    [[ "$EOF_REACHED" == "1" ]] && return 1
+
+    printf '\n%sStep 3 — Tunnel%s\n' "$C_BOLD" "$C_RESET"
     if [[ "$dir" == "R" ]]; then
         printf '  %sThe server listens on the source port and forwards it back here.%s\n' "$C_DIM" "$C_RESET"
     else
@@ -540,7 +660,8 @@ provisioning_form() {
     done
     [[ -n "$host" ]] || { err "Host is required."; return 1; }
 
-    printf '\n%sStep 3 — Review%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n%sStep 4 — Review%s\n' "$C_BOLD" "$C_RESET"
+    printf '  description: %s\n' "${desc:-(none)}"
     printf '  ssh -p %s %s -%s %s:%s:%s %s@%s\n' "$sshport" "$params" "$dir" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
     ask "Save? [y/N]" "y"
     [[ "$EOF_REACHED" == "1" ]] && return 1
@@ -551,7 +672,7 @@ provisioning_form() {
     cfg_set LAST_SSH_PORT "$sshport"
     cfg_set LAST_SOURCE_PORT "$sport"
     cfg_set LAST_DEST_PORT "$dport"
-    save_record "$host" "$user" "$sport" "$dport" "$params" "$sshport"
+    save_record "$host" "$user" "$sport" "$dport" "$params" "$sshport" "$desc"
     local slug; slug="$(slug_of "$host" "$sport")"
     open_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$dir" "$sshport"
 }

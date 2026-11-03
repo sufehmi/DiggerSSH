@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.6.1** — a single-file Bash SSH tunnel manager.
+**v1.7.0** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -145,7 +145,16 @@ Choosing `+ Add new server` starts the provisioning form:
 | SSH Username | last username used |
 | SSH Port | `22` (this is ssh's `-p` argument) |
 
-**Step 2 — Tunnel**
+**Step 2 — Description**
+
+| Prompt | Default |
+|---|---|
+| Description | *(none — free text)* |
+
+A short label for the tunnel, shown as the first column of **List tunnels**.
+Only the first 20 characters are displayed there.
+
+**Step 3 — Tunnel**
 
 | Prompt | Default |
 |---|---|
@@ -155,7 +164,7 @@ Choosing `+ Add new server` starts the provisioning form:
 
 Every default is shown in brackets and is editable — press Enter to accept it.
 
-**Step 3 — Review** shows the exact command that will run, for example:
+**Step 4 — Review** shows the exact command that will run, for example:
 
 ```
 ssh -p 22 -o ServerAliveInterval=30 -o ServerAliveCountMax=5 -R 44641:127.0.0.1:44641 sufehmi@server2.mafindo.or.id
@@ -231,11 +240,26 @@ reachable from the network.
 
 A tunnel's status is not guessed from a PID file. The local process that
 carries the forward argument **is** the tunnel, so DiggerSSH finds it by
-matching the exact `-L`/`-R` argument in `/proc`:
+parsing that argument out of `/proc`:
 
 ```bash
-pgrep -x ssh; pgrep -x autossh      # then match the forward spec in /proc/PID/cmdline
+pgrep -x ssh; pgrep -x autossh      # then parse the -L/-R argument in /proc/PID/cmdline
 ```
+
+The argument is **parsed, not compared as text**. `ssh` accepts many
+spellings of the same forward, and the destination may be any host:port:
+
+```
+-L 44641:127.0.0.1:44641              plain
+-L 127.0.0.1:44641:127.0.0.1:44641     explicit IPv4 bind
+-L [::1]:44641:127.0.0.1:44641         explicit IPv6 bind
+-L 0.0.0.0:44641:127.0.0.1:44641       IPv4 wildcard bind
+```
+
+A whole-string comparison misses tunnels that are plainly running. The
+status then reads `stopped`, the next start collides with the live tunnel,
+and the user is told the port is already in use. The **source port**
+identifies the tunnel; the destination does not have to match the record.
 
 This matters because:
 
@@ -398,6 +422,8 @@ command-line line 0: Bad key types '+ssh-mldsa-65'.
 A tunnel record looks like this:
 
 ```
+ID=server2.mafindo.or.id_44641
+DESCRIPTION=Production DB access
 HOST=server2.mafindo.or.id
 USER=sufehmi
 SOURCE_PORT=44641
