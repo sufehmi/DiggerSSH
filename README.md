@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.5.1** — a single-file Bash SSH tunnel manager.
+**v1.6.0** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -29,6 +29,7 @@ holding the port.
   - [Stop a tunnel](#stop-a-tunnel)
 - [The two forwarding directions](#the-two-forwarding-directions)
 - [How status is determined](#how-status-is-determined)
+- [Key exchange fallback](#key-exchange-fallback)
 - [autossh](#autossh)
 - [Post-quantum (ML-DSA-65) support](#post-quantum-ml-dsa-65-support)
   - [A note on key types](#a-note-on-key-types)
@@ -52,6 +53,10 @@ holding the port.
 - **Live status straight from the kernel** — status is decided by looking up
   the process that actually holds the port, so the list, the connect action
   and the stop action can never disagree with each other.
+- **Graceful algorithm fallback** — the key exchange, host key and public key
+  are negotiated against the server from a chain that ends at ECDH, so an
+  older server gets a working connection instead of an error (see
+  [Key exchange fallback](#key-exchange-fallback)).
 - **Precise stopping** — stopping a tunnel kills the exact `ssh` process
   carrying that forward, never a pattern-matched approximation.
 - **Per-family port checks** — a port can be busy on IPv4 and free on IPv6;
@@ -256,6 +261,56 @@ one explicitly in the forward argument:
 
 ---
 
+## Key exchange fallback
+
+Some `ssh` builds — notably OQS-OpenSSH — print this when the negotiated key
+exchange is not post-quantum:
+
+```
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+```
+
+On a server that offers no post-quantum key exchange at all, that warning is
+noise: the connection succeeds. It reads like a failure, though, so
+DiggerSSH does not leave the choice to `ssh`.
+
+Before opening a tunnel it negotiates the algorithms against **that server**
+and pins them, walking a chain from strongest to weakest:
+
+| Layer | Chain |
+|---|---|
+| Key exchange | `mlkem768x25519-sha256` → `sntrup761x25519-sha512@openssh.com` → `curve25519-sha256` → `ecdh-sha2-nistp256` |
+| Host key | `ssh-mldsa-65` → `ssh-mldsa44-ed25519@openssh.com` → `ssh-ed25519` → `ecdsa-sha2-nistp256` |
+| Public key | same as host key |
+
+The strongest entry that **both** ends support is chosen and recorded, so the
+whole connection degrades together rather than failing at one layer. The
+chain ends at ECDH, which every server supports.
+
+Two details make the probe reliable:
+
+- The KEX is tested by **trying it**. OpenSSH 10.x prints only the
+  *negotiated* algorithm, not the server's full proposal, so the advertised
+  list cannot simply be read off the debug output.
+- The host and public key algorithms come from the server's pre-auth
+  `server-sig-algs` list, which is available before authentication.
+
+Pinning the KEX also silences the spurious warning, because that build only
+emits it when `ssh` picks the algorithm by itself.
+
+Against an OpenSSH 7.9 server with no post-quantum support, the result is:
+
+```
+KexAlgorithms=curve25519-sha256
+HostKeyAlgorithms=ssh-ed25519
+PubkeyAcceptedAlgorithms=ssh-ed25519
+```
+
+and the tunnel opens with no warning on the wire.
+
+---
+
 ## autossh
 
 When `autossh` is on `PATH` it is used as the transport, so the tunnel
@@ -347,6 +402,7 @@ HOST=server2.mafindo.or.id
 USER=sufehmi
 SOURCE_PORT=44641
 DEST_PORT=44641
+SSH_PORT=22
 SSH_PARAMS=-o ServerAliveInterval=30 -o ServerAliveCountMax=5
 CREATED=2026-11-03\ 19:15:29
 ```
