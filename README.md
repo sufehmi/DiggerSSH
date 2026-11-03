@@ -7,7 +7,7 @@
         /____//____/
 ```
 
-**v1.2.0** — an SSH tunnel manager with post-quantum (ML-DSA-65) support.
+**v1.3.0** — an SSH tunnel manager with post-quantum (ML-DSA-65) support.
 
 ## Table of Contents
 
