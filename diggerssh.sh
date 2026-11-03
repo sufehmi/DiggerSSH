@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.8.0 — SSH Tunnel Manager
+#  DiggerSSH v1.8.1 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -90,6 +90,17 @@
 #
 #  The forward target host is fixed at 127.0.0.1 on the far side.
 #
+#  The server form
+#  ----------------
+#  "Add new server" asks for the source and destination ports as well as
+#  the server details, because the forward argument is built from them:
+#
+#      -R <source>:127.0.0.1:<dest>     the server listens
+#      -L <source>:127.0.0.1:<dest>     this machine listens
+#
+#  Registering a server from a tunnel menu therefore also creates and
+#  opens the tunnel, rather than leaving a server with no forward.
+#
 #  Orphan tunnels
 #  --------------
 #  A tunnel whose server is not registered is kept and listed, marked
@@ -98,7 +109,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -613,7 +624,7 @@ orphan_tunnels() {
 SEL_SLUG=""; SEL_HOST=""; SEL_USER=""; SEL_SSHPORT=""; SEL_PARAMS=""; SEL_DESC=""
 
 server_menu() {
-    local title="$1"
+    local title="$1" mode="${2:-}"
     local out; out="$(list_servers)"
     local total; total="$(printf '%s\n' "$out" | grep -c . || true)"
 
@@ -639,7 +650,14 @@ server_menu() {
     [[ "$EOF_REACHED" == "1" ]] && return 1
     if [[ "$REPLY" == "0" ]]; then return 1; fi
     if [[ "$REPLY" == "$add" ]]; then
-        add_server_form || true
+        # The form needs a bare R or L, and nothing at all for "stop",
+        # where no forward is being built.
+        local fdir=""
+        case "$mode" in
+            open-R) fdir="R" ;;
+            open-L) fdir="L" ;;
+        esac
+        add_server_form "$fdir" || true
         return 2      # show the list again, now including the new server
     fi
     if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= total )); then
@@ -714,7 +732,7 @@ tiered_menu() {
     local title="$1" mode="$2"
     while true; do
         local rc=0
-        server_menu "$title" || rc=$?
+        server_menu "$title" "$mode" || rc=$?
         case "$rc" in
             0) ;;                    # a server was chosen
             2) continue ;;          # a server was added — show the list again
@@ -999,7 +1017,10 @@ do_delete() {
 
 # ============================================================ provisioning ===
 # Tier 1 — register a server. The record lives in ~/.diggerssh/servers/.
+# $1 is the direction to build: "R", "L", or empty when no tunnel is
+# wanted (the "Stop a tunnel" menu only registers the server).
 add_server_form() {
+    local dir="${1:-}"
     printf '\n%s── Add New Server ──%s\n' "$C_BOLD" "$C_CYAN"
     local last_host last_user
     last_host="$(cfg_get LAST_HOST "")"
@@ -1025,12 +1046,40 @@ add_server_form() {
     ask "SSH parameters" "$DEFAULT_SSH_PARAMS"; local params="$REPLY"
     [[ "$EOF_REACHED" == "1" ]] && return 1
 
-    printf '\n%sStep 4 — Review%s\n' "$C_BOLD" "$C_RESET"
+    # The ports belong to this form: the forward argument is built from
+    # them, and the direction decides which side listens.
+    local sport="" dport=""
+    if [[ -n "$dir" ]]; then
+        printf '\n%sStep 4 — Tunnel%s\n' "$C_BOLD" "$C_RESET"
+        if [[ "$dir" == "R" ]]; then
+            printf '  %sThe server listens on the source port and forwards it back here.%s\n' "$C_DIM" "$C_RESET"
+        else
+            printf '  %sThis machine listens on the source port and forwards into the server.%s\n' "$C_DIM" "$C_RESET"
+        fi
+        ask "Source Port" "$sshport"; sport="$REPLY"
+        [[ "$EOF_REACHED" == "1" ]] && return 1
+        ask "Destination Port" "$sport"; dport="$REPLY"
+        [[ "$EOF_REACHED" == "1" ]] && return 1
+
+        for p in "$sport" "$dport"; do
+            if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+                err "Invalid port: $p"; return 1
+            fi
+        done
+    fi
+
+    printf '\n%sStep %d — Review%s\n' "$C_BOLD" "$([[ -n "$dir" ]] && echo 5 || echo 4)" "$C_RESET"
     printf '  host:        %s\n' "$host"
     printf '  user:        %s\n' "$user"
     printf '  ssh port:    %s\n' "$sshport"
     printf '  description: %s\n' "${desc:-(none)}"
     printf '  ssh params:  %s\n' "$params"
+    if [[ -n "$dir" ]]; then
+        printf '  source port: %s\n' "$sport"
+        printf '  dest port:   %s\n' "$dport"
+        printf '  ssh -p %s %s -%s %s:%s:%s %s@%s\n' \
+            "$sshport" "$params" "$dir" "$sport" "$TARGET_HOST" "$dport" "$user" "$host"
+    fi
     ask "Save? [y/N]" "y"
     [[ "$EOF_REACHED" == "1" ]] && return 1
     [[ "${REPLY,,}" == "y" ]] || { warn "Cancelled."; return 1; }
@@ -1044,6 +1093,15 @@ add_server_form() {
     # A tunnel recorded for this server before it was registered becomes
     # visible again now that the server exists.
     attach_orphans "$slug" "$host" "$sshport"
+
+    # Registering a server from a tunnel menu also creates the tunnel, so
+    # the forward the user asked for actually exists.
+    if [[ -n "$dir" ]]; then
+        cfg_set LAST_SOURCE_PORT "$sport"
+        cfg_set LAST_DEST_PORT "$dport"
+        local tslug; tslug="$(save_tunnel "$slug" "$host" "$user" "$sport" "$dport" "$sshport" "$params" "$desc")"
+        open_tunnel "$tslug" "$host" "$user" "$sport" "$dport" "$dir" "$sshport"
+    fi
 }
 
 # Tier 2 — create a tunnel on an already-registered server.

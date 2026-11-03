@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.0** — a single-file Bash SSH tunnel manager.
+**v1.8.1** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -121,7 +121,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.0  SSH tunnel manager
+   v1.8.1  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -138,8 +138,20 @@ go with it.
 
 | Entry | What it does |
 |---|---|
-| `+ Add new server` | Asks for host, username, SSH port, description and SSH parameters; saves one file in `~/.diggerssh/servers/` |
+| `+ Add new server` | Asks for host, username, SSH port, description, SSH parameters **and the source and destination ports**; saves the server, saves the tunnel and opens it |
 | `+ Create tunnel on this server` | Asks for the source and destination ports; saves one file in `~/.diggerssh/tunnels/` |
+
+The ports are part of the `+ Add new server` form because the forward
+argument is built from them: the source port is the port that listens,
+and the direction decides which side listens.
+
+| Menu | Direction | Meaning |
+|---|---|---|
+| `Create Tunnel to Server` | `-R` | The server listens on the source port and forwards it back here |
+| `Connect Tunnel (to a server's Port)` | `-L` | This machine listens on the source port and forwards into the server |
+
+In the `Stop a tunnel` menu no forward is being built, so `+ Add new
+server` registers the server only and asks for no ports.
 
 A tunnel whose server is not registered is kept and listed, marked
 `(no server)`, but it does not appear under any server. Registering the
