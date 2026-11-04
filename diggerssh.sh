@@ -453,6 +453,18 @@ tunnel_pids() {
     done < <(tunnel_processes "$sport" "") | sort -u
 }
 
+# Every PID carrying this forward in ONE direction. A -R and a -L may run
+# on the same port at the same time, so stopping one must not take the
+# other with it.
+tunnel_pids_dir() {
+    local sport="$1" dport="$2" dir="$3"
+    local pid fdir spec
+    while IFS=$'\t' read -r pid fdir spec; do
+        [[ -n "$pid" ]] || continue
+        printf '%s\n' "$pid"
+    done < <(tunnel_processes "$sport" "$dir") | sort -u
+}
+
 tunnel_dir() {
     local sport="$1" dport="$2" dir
     for dir in L R; do
@@ -1172,8 +1184,24 @@ open_tunnel() {
 
 stop_tunnel() {
     local slug="$1" host="$2" sport="$3" dport="$4"
+    # A -R and a -L may run on the same port at the same time. Stopping one
+    # must not take the other with it, so the direction is decided first and
+    # only that direction is killed. The opposite direction, if any, is
+    # reported so the user knows it is still there.
+    local dir other=""
+    for d in L R; do
+        if tunnel_pid "$sport" "$dport" "$d" >/dev/null 2>&1; then
+            dir="$d"; break
+        fi
+    done
+    [[ -n "$dir" ]] || dir="R"
+    for d in L R; do
+        [[ "$d" == "$dir" ]] && continue
+        tunnel_pid "$sport" "$dport" "$d" >/dev/null 2>&1 && other="$d"
+    done
+
     local pid
-    if ! pid="$(tunnel_pid "$sport" "$dport")"; then
+    if ! pid="$(tunnel_pid "$sport" "$dport" "$dir")"; then
         warn "Tunnel $slug is not running."
         return 0
     fi
@@ -1184,9 +1212,9 @@ stop_tunnel() {
         [[ "$pcomm" == "autossh" ]] && kill "$parent" 2>/dev/null || true
     fi
     sleep 1
-    # Any process still carrying this forward, in either direction.
+    # Any process still carrying this forward in the SAME direction.
     local p parent2
-    for p in $(tunnel_pids "$sport" "$dport"); do
+    for p in $(tunnel_pids_dir "$sport" "$dport" "$dir"); do
         kill "$p" 2>/dev/null || true
         parent2="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
         if [[ -n "$parent2" && "$parent2" != "1" ]]; then
@@ -1195,12 +1223,17 @@ stop_tunnel() {
         fi
     done
     sleep 1
-    if tunnel_pid "$sport" "$dport" >/dev/null 2>&1; then
+    if tunnel_pid "$sport" "$dport" "$dir" >/dev/null 2>&1; then
         warn "Tunnel $slug is still running — the ssh process did not exit."
         log_write "Tunnel $slug did not stop cleanly"
     else
-        ok "Tunnel $slug stopped."
-        log_write "Tunnel $slug stopped"
+        ok "Tunnel $slug stopped (-$dir)."
+        log_write "Tunnel $slug stopped (-$dir)"
+    fi
+    # The other direction on the same port is a separate tunnel and stays.
+    if [[ -n "$other" ]]; then
+        local opid; opid="$(tunnel_pid "$sport" "$dport" "$other" 2>/dev/null || true)"
+        info "the -$other tunnel on port $sport is still running (pid ${opid:-unknown})."
     fi
 }
 
