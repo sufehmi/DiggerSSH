@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.8.4 — SSH Tunnel Manager
+#  DiggerSSH v1.8.5 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -133,7 +133,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.8.4"
+VERSION="1.8.5"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -1034,24 +1034,31 @@ open_tunnel() {
     # is for the ssh CHILD: autossh exists from the first moment and would
     # report success for a connection that is failing and being retried.
     #
-    # For a LOCAL forward the ground truth is the bound socket, and it only
-    # appears once ssh has connected and bound, which is AFTER the process
-    # shows up. So the loop keeps polling until the socket is really there;
-    # testing once would report a healthy tunnel as dead.
+    # A process that is alive is not proof of anything by itself: ssh binds
+    # a local forward only AFTER the handshake completes, so on a slow or
+    # lossy link the process sits there for a while with nothing bound, and
+    # a tool that checks too early calls a working tunnel dead. Worse, a
+    # process that is alive but never ESTABLISHED is stuck connecting and
+    # will never bind, and ssh says nothing while it waits — so the log
+    # holds nothing but the command line and the failure is unexplained.
     #
-    # A remote forward cannot be checked this way, since its listener is on
-    # the server, so there the live ssh process is the evidence.
-    local waited=0 worker="" bound=0
-    while (( waited < 20 )); do
+    # State 01 in /proc/net/tcp is ESTABLISHED: the handshake is done. That
+    # is the signal that separates "slow but working" from "hung". The wait
+    # is generous so a slow link is given every chance to finish.
+    local waited=0 worker="" established=0
+    while (( waited < 90 )); do
+        # A fast failure is visible in the log immediately — a bind conflict,
+        # a refused connection, a denied key. Report it now, not after 90s.
+        if [[ -s "$tlog" ]]; then
+            case "$(cat "$tlog" 2>/dev/null)" in
+                *"Address already in use"*|*"bind:"*|*"Connection refused"*|*"Permission denied"*|*"Host key verification failed"*|*"Network is unreachable"*|*"Connection timed out"*|*"No route to host"*|*"Too many authentication"*)
+                    break ;;
+            esac
+        fi
         if worker="$(tunnel_worker_pid "$sport" "$dport" "$dir")"; then
             if [[ "$(cat "/proc/$worker/comm" 2>/dev/null)" == "ssh" ]]; then
-                if [[ "$dir" == "L" ]]; then
-                    if family_in_use "$sport" ipv4 || family_in_use "$sport" ipv6; then
-                        bound=1
-                        break
-                    fi
-                else
-                    bound=1
+                if ssh_established "$worker"; then
+                    established=1
                     break
                 fi
             fi
@@ -1060,14 +1067,89 @@ open_tunnel() {
         waited=$(( waited + 1))
     done
 
+    # The connection is up. A -R's listener is on the server, so the live
+    # connection is the evidence; a -L's listener is local and binds right
+    # after the handshake, so give it a moment to appear.
+    local bound=0
+    if (( established )); then
+        if [[ "$dir" == "R" ]]; then
+            bound=1
+        else
+            local b=0
+            while (( b < 15 )); do
+                if family_in_use "$sport" ipv4 || family_in_use "$sport" ipv6; then
+                    bound=1
+                    break
+                fi
+                sleep 1
+                b=$(( b + 1))
+            done
+        fi
+    fi
+
     if (( ! bound )); then
         err "Tunnel did not come up."
         log_write "Tunnel $slug did not come up (-$dir, $host:$sport)"
-        err "  ssh is running but port $sport is NOT bound locally —"
-        err "  the forward could not be established."
-        local holder; holder="$(socket_owner_pids "$sport" | head -1)"
-        if [[ -n "$holder" ]]; then
-            err "  port $sport is held by pid $holder ($(cat "/proc/$holder/comm" 2>/dev/null))"
+        if (( established )); then
+            # The connection is up but the local bind never appeared. That
+            # is a genuine forward failure, not a slow link.
+            err "  ssh connected, but port $sport is NOT bound locally."
+            err "  the forward itself failed."
+            local holder; holder="$(socket_owner_pids "$sport" | head -1)"
+            if [[ -n "$holder" ]]; then
+                err "  port $sport is held by pid $holder ($(cat "/proc/$holder/comm" 2>/dev/null))"
+            fi
+        else
+            # Alive but never ESTABLISHED: the handshake never finished. If
+            # ssh already wrote why, lead with that; otherwise the socket
+            # state is the only evidence (ssh waits silently, so the log has
+            # nothing but the command line).
+            local cause=""
+            case "$(cat "$tlog" 2>/dev/null)" in
+                *"Address already in use"*|*"bind:"*)              cause="port $sport is already taken" ;;
+                *"Connection refused"*)                            cause="the server refused the connection" ;;
+                *"Permission denied"*)                             cause="the server rejected the login (Permission denied)" ;;
+                *"Host key verification failed"*)                  cause="host key verification failed" ;;
+                *"Network is unreachable"*)                        cause="the network is unreachable" ;;
+                *"Connection timed out"*)                          cause="the connection timed out" ;;
+                *"No route to host"*)                              cause="there is no route to the host" ;;
+                *"Too many authentication"*)                       cause="too many authentication failures" ;;
+            esac
+            if [[ -n "$cause" ]]; then
+                err "  ssh could not connect: $cause."
+                err "  (the full error is in the log below)"
+            else
+                err "  ssh (pid ${worker:-unknown}) is alive but never finished connecting"
+                err "  (waited ${waited}s). Socket state: $(socket_state_desc "${worker:-}")"
+                if [[ "$(socket_state_desc "${worker:-}")" == *SYN_SENT* ]]; then
+                    err "  SYN_SENT means the server is not answering — check the"
+                    err "  host, the SSH port ($sshport), and anything in between."
+                else
+                    err "  it is stuck mid-handshake, or the link is too slow."
+                fi
+            fi
+        fi
+        # A hung attempt must not be left running: it shows up in ps and in
+        # the next attempt as a live tunnel that is not actually working.
+        # Only the processes this attempt started are killed.
+        local pz ppz
+        for pz in $(tunnel_pids "$sport" "$dport"); do
+            [[ "$before_pids" == *" $pz "* ]] && continue
+            kill "$pz" 2>/dev/null
+            ppz="$(ps -o ppid= -p "$pz" 2>/dev/null | tr -d ' ')"
+            if [[ -n "$ppz" && "$ppz" != "1" && "$ppz" != "$$" ]]; then
+                [[ "$(cat "/proc/$ppz/comm" 2>/dev/null)" == "autossh" ]] && kill "$ppz" 2>/dev/null
+            fi
+        done
+        err "  the attempt was stopped; nothing is left running."
+        local log; log="$(cat "$tlog" 2>/dev/null)"
+        if [[ -n "$log" ]]; then
+            err "  Log:"
+            printf '%s\n' "$log" | sed 's/^/    /'
+        fi
+        if [[ -s "$launcher_err" ]]; then
+            err "  Launcher:"
+            sed 's/^/    /' "$launcher_err" 2>/dev/null | head -5
         fi
     elif pid="$(tunnel_worker_pid "$sport" "$dport" "$dir")" && \
        [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == "ssh" ]]; then
@@ -1079,106 +1161,12 @@ open_tunnel() {
             log_write "Tunnel $slug started (pid $pid, -$dir)"
         fi
     else
-        # A bind failure means the port is already taken. Say so plainly and
-        # name the holder, rather than leaving the raw ssh error to explain.
-        local log; log="$(cat "$TUNNEL_DIR/$slug.log" 2>/dev/null)"
-        if printf '%s' "$log" | grep -qi "address already in use"; then
-            err "Port $sport is already in use — the tunnel could not bind."
-            # ss -p only names sockets you own, so a tunnel running as
-            # another user shows no pid there even though /proc exposes its
-            # command line. Look in both places.
-            local holder; holder="$(socket_owner_pids "$sport" | head -1)"
-            if [[ -z "$holder" ]]; then
-                holder="$(tunnel_pids "$sport" "" | head -1)"
-            fi
-            if [[ -n "$holder" ]]; then
-                local hcomm; hcomm="$(cat "/proc/$holder/comm" 2>/dev/null)"
-                err "  held by $hcomm (pid $holder)"
-                if [[ "$hcomm" == "ssh" || "$hcomm" == "autossh" ]]; then
-                    err "  that is an SSH tunnel already forwarding port $sport."
-                    err "  It is not one of the tunnels DiggerSSH tracks, so it was"
-                    err "  not started here. Stop it manually: kill $holder"
-                else
-                    err "  it is not an ssh tunnel — free the port and retry."
-                fi
-                # Clean up this attempt's own supervisor so the next try is
-                # not blocked by a retrying process nobody can see.
-                local p3 pp3
-                for p3 in $(tunnel_pids "$sport" "$dport"); do
-                    [[ "$before_pids" == *" $p3 "* ]] && continue
-                    kill "$p3" 2>/dev/null
-                    pp3="$(ps -o ppid= -p "$p3" 2>/dev/null | tr -d ' ')"
-                    if [[ -n "$pp3" && "$pp3" != "1" && "$pp3" != "$$" ]]; then
-                        [[ "$(cat "/proc/$pp3/comm" 2>/dev/null)" == "autossh" ]] && kill "$pp3" 2>/dev/null
-                    fi
-                done
-            else
-                err "  no local process owns it; the port is probably bound"
-                err "  on the server side of an -R tunnel."
-            fi
-        else
-            err "Tunnel did not come up."
-            log_write "Tunnel $slug did not come up (-$dir, $host:$sport)"
-            # autossh retries a failing connection, so the supervisor may
-            # still be alive while nothing is actually connected. Say so
-            # rather than leaving it looking half-alive.
-            local sup; sup="$(tunnel_worker_pid "$sport" "$dport" "$dir" || true)"
-            if [[ -n "$sup" ]] && [[ "$(cat "/proc/$sup/comm" 2>/dev/null)" == "autossh" ]]; then
-                err "  autossh is still retrying (pid $sup), but no ssh connection"
-                err "  was established — the tunnel is NOT up."
-            fi
-            # Stop what this attempt started. A supervisor left retrying
-            # would make the next attempt report the port as carried by an
-            # unrelated process, and the tool had no way to clear it.
-            local p2 pp2 cleaned=0
-            for p2 in $(tunnel_pids "$sport" "$dport"); do
-                [[ "$before_pids" == *" $p2 "* ]] && continue
-                kill "$p2" 2>/dev/null && cleaned=1
-                pp2="$(ps -o ppid= -p "$p2" 2>/dev/null | tr -d ' ')"
-                if [[ -n "$pp2" && "$pp2" != "1" && "$pp2" != "$$" ]]; then
-                    [[ "$(cat "/proc/$pp2/comm" 2>/dev/null)" == "autossh" ]] && kill "$pp2" 2>/dev/null
-                fi
-            done
-            if (( cleaned )); then
-                err "  the failed attempt was cleaned up; nothing is left retrying."
-            fi
-            if [[ -n "$log" ]]; then
-                err "  Log:"
-                printf '%s\n' "$log" | sed 's/^/    /'
-            else
-                err "  ssh produced no output at all — it exited without saying why."
-                err "  The log holds the exact command that was run."
-            fi
-            # The launcher's own stderr. This is where "setsid: command not
-            # found" and friends land — the reason a tunnel can fail to
-            # start with nothing at all in its log.
-            if [[ -s "$launcher_err" ]]; then
-                err "  Launcher:"
-                sed 's/^/    /' "$launcher_err" 2>/dev/null | head -5
-            fi
-            # What the tool can actually see right now. If an ssh process
-            # IS carrying this port, the tunnel is up and the status check
-            # is what failed.
-            local seen; seen="$(tunnel_pids "$sport" "$dport" | tr '\n' ' ')"
-            if [[ -n "${seen// /}" ]]; then
-                err "  an ssh process IS carrying port $sport (pid ${seen// /, /, })"
-                err "  — the tunnel is up; the status check failed to see it."
-            fi
-            # Show what ps sees for this port, so the cause is visible
-            # without leaving the tool.
-            local view; view="$(ps_view "$sport")"
-            if [[ -n "$view" ]]; then
-                err "  ps auxw | grep $sport:"
-                printf '%s\n' "$view" | sed 's/^/    /' >&2
-            fi
-            # And whether anything is now carrying the forward.
-            local after
-            while IFS=$'\t' read -r after _ _; do
-                [[ -n "$after" ]] || continue
-                err "  an ssh process (pid $after) does carry this forward now"
-            done < <(existing_tunnel "$sport")
-        fi
-        return 1
+        # bound is 1 but the worker could not be re-found. The socket is
+        # bound and the connection is up, so the tunnel IS working — only
+        # the process lookup failed. Report success; do not call it a
+        # failure when the kernel says it is forwarding.
+        ok "Tunnel started — the connection is up and the forward is bound."
+        log_write "Tunnel $slug started (established, -$dir; worker pid not re-found)"
     fi
 }
 
@@ -1555,13 +1543,13 @@ family_in_use() {
 # symlinks in /proc/PID/fd, which is how the kernel links the two.
 socket_owner_pids() {
     local port="$1"
-    local hexport sl laddr raddr st txrx trwhen retr uid tmo inode
+    local hexport sl laddr raddr st txrx trwhen retr uid tmo inode rest
     printf -v hexport '%04X' "$port" 2>/dev/null || return 0
     local -a inodes=()
     local f
     for f in /proc/net/tcp /proc/net/tcp6; do
         [[ -r "$f" ]] || continue
-        while read -r sl laddr raddr st txrx trwhen retr uid tmo inode; do
+        while read -r sl laddr raddr st txrx trwhen retr uid tmo inode rest; do
             [[ "$st" == "0A" ]] || continue
             [[ "${laddr##*:}" == "$hexport" ]] || continue
             [[ -n "$inode" ]] && inodes+=( "$inode" )
@@ -1580,6 +1568,73 @@ socket_owner_pids() {
             done
         done
     done
+}
+
+# The state codes of every socket owned by a process, one per line.
+# State 01 is ESTABLISHED (the handshake is done), 0A is LISTEN; the rest
+# are transient phases such as 02 SYN_SENT, which is what a connection
+# that is stuck waiting for the server looks like.
+socket_states() {
+    local pid="$1" fd tgt inode
+    local -a myinodes=()
+    for fd in "/proc/$pid/fd"/*; do
+        tgt="$(readlink "$fd" 2>/dev/null)"
+        case "$tgt" in
+            socket:\[*\]) inode="${tgt#socket:[}"; inode="${inode%]}"; [[ -n "$inode" ]] && myinodes+=( "$inode" ) ;;
+        esac
+    done
+    (( ${#myinodes[@]} )) || return 0
+    local f sl laddr raddr st ino i
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r "$f" ]] || continue
+        while read -r sl laddr raddr st _ _ _ _ _ ino _; do
+            for i in "${myinodes[@]}"; do
+                [[ "$ino" == "$i" ]] && printf '%s\n' "$st"
+            done
+        done < "$f"
+    done
+}
+
+# Whether the process has at least one ESTABLISHED TCP connection — the
+# handshake has finished. A live ssh process with no ESTABLISHED socket
+# is stuck connecting and will never bind the forward.
+# Note: this must NOT be a pipe into grep. The script runs with
+# `set -o pipefail`, and grep -q closes the pipe on its first match, which
+# sends SIGPIPE to socket_states and makes the whole test report false.
+ssh_established() {
+    local states st
+    states="$(socket_states "$1")"
+    while IFS= read -r st; do
+        [[ "$st" == "01" ]] && return 0
+    done <<< "$states"
+    return 1
+}
+
+# Decode a process's socket states into words, for the failure message.
+socket_state_desc() {
+    local pid="${1:-}" states
+    [[ -n "$pid" ]] || { printf 'no process'; return 0; }
+    states="$(socket_states "$pid" | sort -u | tr '\n' ' ')"
+    states="${states% }"
+    [[ -n "$states" ]] || { printf 'no sockets'; return 0; }
+    local out="" s
+    for s in $states; do
+        case "$s" in
+            01) out+="ESTABLISHED " ;;
+            02) out+="SYN_SENT " ;;
+            03) out+="SYN_RECV " ;;
+            04) out+="FIN_WAIT1 " ;;
+            05) out+="FIN_WAIT2 " ;;
+            06) out+="TIME_WAIT " ;;
+            07) out+="CLOSE " ;;
+            08) out+="CLOSE_WAIT " ;;
+            09) out+="LAST_ACK " ;;
+            0A) out+="LISTEN " ;;
+            0B) out+="CLOSING " ;;
+            *)  out+="$s " ;;
+        esac
+    done
+    printf '%s' "${out% }"
 }
 
 init_state() {

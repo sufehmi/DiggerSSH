@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.4** — a single-file Bash SSH tunnel manager.
+**v1.8.5** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -125,7 +125,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.4  SSH tunnel manager
+   v1.8.5  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -333,6 +333,28 @@ A tunnel in the *opposite* direction is allowed, with a note saying so:
 Before v1.8.3 the preflight was direction-blind and refused the pair
 outright, which made the second menu unusable for the very record the
 first menu had just created.
+
+### A live ssh process is not a working tunnel
+
+`ssh` binds a local forward **only after the handshake completes**. On a
+slow or lossy link — or when the server simply is not answering — the
+process sits there with nothing bound, and it says **nothing** while it
+waits. That is the failure behind "ssh is running but the port is not
+bound": the process was alive in `ps`, but the connection never finished,
+so the forward never appeared and the log held nothing but the command
+line.
+
+The tool reads the process's socket state straight from `/proc/net/tcp`:
+
+- **`01` ESTABLISHED** — the handshake is done; the tunnel is real.
+- **`02` SYN_SENT** — the server is not answering. The forward can never
+  bind. The tool now says exactly that instead of a bare "not bound".
+
+The wait for the tunnel is generous (it gives a slow link every chance to
+finish), and a fast failure — a refused connection, an unreachable
+network, a denied key — is reported the moment it lands in the log rather
+than after the full wait. A connection that never finishes is killed, so
+it does not linger in `ps` looking like a live tunnel.
 
 ### Wildcard listeners count as "in use"
 
