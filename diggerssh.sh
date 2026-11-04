@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  DiggerSSH v1.8.3 — SSH Tunnel Manager
+#  DiggerSSH v1.8.4 — SSH Tunnel Manager
 #
 #  Forwarding direction
 #  --------------------
@@ -133,7 +133,7 @@
 # ============================================================================
 
 set -o pipefail
-VERSION="1.8.3"
+VERSION="1.8.4"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -303,25 +303,85 @@ forward_dest() {
     [[ -n "${FWD_FIELDS[2]}" ]] && printf '%s:%s' "${FWD_FIELDS[2]}" "${FWD_FIELDS[3]}"
 }
 
-# The ssh transports on this machine, enumerated with ps.
+# ─────────────────────────── kernel-first inspection ───────────────────
 #
-# The user checks this by hand with "ps auxw | grep <port>", so the tool
-# uses the same source: ps lists the processes, and /proc/PID/cmdline gives
-# the exact argument vector to parse. That means the tool's answer and the
-# user's own "ps auxw" answer cannot disagree about whether a tunnel is up.
+# The tool used to depend on four external commands that may be absent or
+# behave differently on another machine:
 #
-# Prints "pid<TAB>command line" for each ssh/autossh process.
+#   ps -eo pid=,comm=,args=   (GNU-specific format)
+#   ss -ltn                   (iproute2)
+#   awk                       (for the timestamp filter)
+#   setsid                    (util-linux)
+#
+# Each of those was a silent failure mode. If ps did not understand the
+# format, no tunnel was ever found; if ss was missing, every port looked
+# free; if setsid was missing, the launcher never started and its error
+# message was discarded by 2>/dev/null. In every case the tool reported
+# "Tunnel did not come up" and the user got no reason.
+#
+# So: the kernel's own view under /proc is the source of record. It is
+# always present on Linux and needs no external command at all.
+#
+# The hex forms below are how the kernel prints a local address in
+# /proc/net/tcp and /proc/net/tcp6. Each 32-bit word is little-endian,
+# which is why 127.0.0.1 reads as 0100007F rather than 7F000001.
+_HEX_V4_LOOP="0100007F"                            # 127.0.0.1
+_HEX_V4_ANY="00000000"                             # 0.0.0.0
+_HEX_V6_LOOP="00000000000000000000000001000000"    # ::1
+_HEX_V6_ANY="00000000000000000000000000000000"     # ::
+
+# Every ssh/autossh process on this machine, read from /proc.
+# Prints "pid<TAB>command line" for each.
+#
+# /proc/PID/cmdline holds the exact argument vector, so the tool parses
+# the same text the user sees with "ps auxw | grep <port>" — the two can
+# never disagree about whether a tunnel is up.
 ssh_processes() {
-    local pid comm args
-    while read -r pid comm args; do
-        [[ -n "$pid" ]] || continue
+    local pid comm cmd
+    for pid in /proc/[0-9]*; do
+        pid="${pid#/proc/}"
+        [[ -r "/proc/$pid/comm" && -r "/proc/$pid/cmdline" ]] || continue
+        # Read comm with the shell builtin: a fork per process on the
+        # machine would be slow, and this runs inside every status check.
+        IFS= read -r comm < "/proc/$pid/comm" 2>/dev/null || continue
         case "$comm" in
             ssh|autossh) ;;
             *) continue ;;
         esac
-        [[ -r "/proc/$pid/cmdline" ]] || continue
-        printf '%s\t%s\n' "$pid" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-    done < <(ps -eo pid=,comm=,args= 2>/dev/null)
+        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+        [[ -n "$cmd" ]] || continue
+        printf '%s\t%s\n' "$pid" "$cmd"
+    done
+}
+
+# The same view, formatted the way the user runs it by hand. ps is used
+# when it is there because that is literally what the user compares
+# against; /proc is the fallback so the view is never simply missing.
+ps_view() {
+    local port="$1"
+    local pid comm args cmd found=0
+    # ps first, because that is literally what the user runs by hand. A ps
+    # that does not understand the format yields nothing, so the /proc
+    # scan is used as the fallback rather than being skipped outright.
+    if command -v ps >/dev/null 2>&1; then
+        while read -r pid comm args; do
+            [[ -n "$pid" ]] || continue
+            case "$comm" in
+                ssh|autossh) ;;
+                *) continue ;;
+            esac
+            case "$args" in
+                *"$port"*) printf '%s\n' "$args"; found=1 ;;
+            esac
+        done < <(ps -eo pid=,comm=,args= 2>/dev/null)
+        (( found )) && return 0
+    fi
+    while IFS=$'\t' read -r pid cmd; do
+        [[ -n "$pid" ]] || continue
+        case "$cmd" in
+            *"$port"*) printf '%s\n' "$cmd" ;;
+        esac
+    done < <(ssh_processes)
 }
 
 # Every ssh process carrying a forward for the given source port.
@@ -439,20 +499,6 @@ existing_tunnel() {
 # from "ps auxw | grep <port>". Only the ssh transports are shown: the
 # interesting line is the one that carries the forward, and a wall of
 # unrelated shells that merely mention the number helps nobody.
-ps_view() {
-    local port="$1"
-    local pid comm args
-    while read -r pid comm args; do
-        [[ -n "$pid" ]] || continue
-        case "$comm" in
-            ssh|autossh) ;;
-            *) continue ;;
-        esac
-        case "$args" in
-            *"$port"*) printf '%s\n' "$args" ;;
-        esac
-    done < <(ps -eo pid=,comm=,args= 2>/dev/null)
-}
 
 # ============================================================ kex negotiation =
 # The chain, strongest first. "PQ" marks a post-quantum key exchange.
@@ -933,23 +979,85 @@ open_tunnel() {
 
     # The transport's exit status is appended to the log when it ends, so a
     # silent death is still recorded.
-    setsid bash -c "{ $cmdline 2>&1 | awk '$LOG_FILTER_AWK'; printf '[%s] transport exited with status %s\n' \"\$(date '+%Y-%m-%d %H:%M:%S')\" \"\${PIPESTATUS[0]}\"; }" \
-        >> "$tlog" 2>/dev/null < /dev/null &
+    #
+    # The launcher must be detached (it outlives this script and must not
+    # hold the terminal open) and it must not fail SILENTLY. Previously its
+    # stderr went to /dev/null, so a launcher that could not start at all —
+    # "setsid: command not found", say — left an empty log and a bare
+    # "Tunnel did not come up" with no reason given. Its stderr is now
+    # captured next to the log and shown when a tunnel fails.
+    #
+    # setsid is preferred; nohup is the fallback for a system without
+    # util-linux. The timestamp filter uses awk when it is there and a
+    # shell loop otherwise — the loop lives in this separate bash process,
+    # where it does receive EOF when the writer exits.
+    local runner filter launcher_err
+    runner="$TUNNEL_DIR/$slug.launch.sh"
+    launcher_err="$TUNNEL_DIR/$slug.launch.err"
+    : > "$launcher_err"
+    if command -v awk >/dev/null 2>&1; then
+        filter="awk '$LOG_FILTER_AWK'"
+    else
+        filter="while IFS= read -r __dg_line; do printf '[%s] %s\\n' \"\$(date '+%Y-%m-%d %H:%M:%S')\" \"\$__dg_line\"; done"
+    fi
+    {
+        printf '%s\n' "#!/usr/bin/env bash"
+        printf '%s\n' "# Generated by DiggerSSH to run one tunnel. Do not edit."
+        printf '%s\n' "set -o pipefail"
+        printf '%s\n' "{ $cmdline"
+        printf '%s\n' "} 2>&1 | $filter"
+        printf '%s\n' "printf '[%s] transport exited with status %s\\n' \"\$(date '+%Y-%m-%d %H:%M:%S')\" \"\${PIPESTATUS[0]}\""
+    } > "$runner"
+    chmod 700 "$runner" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
+    elif command -v nohup >/dev/null 2>&1; then
+        nohup bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
+    else
+        bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
+    fi
     disown 2>/dev/null || true
     # Give the connection time to establish. autossh spawns ssh as a child,
     # so a short window can catch the process before it has bound. The test
     # is for the ssh CHILD: autossh exists from the first moment and would
     # report success for a connection that is failing and being retried.
-    local waited=0 worker=""
-    while (( waited < 15 )); do
+    #
+    # For a LOCAL forward the ground truth is the bound socket, and it only
+    # appears once ssh has connected and bound, which is AFTER the process
+    # shows up. So the loop keeps polling until the socket is really there;
+    # testing once would report a healthy tunnel as dead.
+    #
+    # A remote forward cannot be checked this way, since its listener is on
+    # the server, so there the live ssh process is the evidence.
+    local waited=0 worker="" bound=0
+    while (( waited < 20 )); do
         if worker="$(tunnel_worker_pid "$sport" "$dport" "$dir")"; then
-            [[ "$(cat "/proc/$worker/comm" 2>/dev/null)" == "ssh" ]] && break
+            if [[ "$(cat "/proc/$worker/comm" 2>/dev/null)" == "ssh" ]]; then
+                if [[ "$dir" == "L" ]]; then
+                    if family_in_use "$sport" ipv4 || family_in_use "$sport" ipv6; then
+                        bound=1
+                        break
+                    fi
+                else
+                    bound=1
+                    break
+                fi
+            fi
         fi
         sleep 1
-        waited=$((waited + 1))
+        waited=$(( waited + 1))
     done
 
-    if pid="$(tunnel_worker_pid "$sport" "$dport" "$dir")" && \
+    if (( ! bound )); then
+        err "Tunnel did not come up."
+        log_write "Tunnel $slug did not come up (-$dir, $host:$sport)"
+        err "  ssh is running but port $sport is NOT bound locally —"
+        err "  the forward could not be established."
+        local holder; holder="$(socket_owner_pids "$sport" | head -1)"
+        if [[ -n "$holder" ]]; then
+            err "  port $sport is held by pid $holder ($(cat "/proc/$holder/comm" 2>/dev/null))"
+        fi
+    elif pid="$(tunnel_worker_pid "$sport" "$dport" "$dir")" && \
        [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == "ssh" ]]; then
         if [[ -n "$kexalgo" ]]; then
             ok "Tunnel started (pid $pid) — kex $kexalgo, $host:$sport → local:$TARGET_HOST:$dport"
@@ -1028,6 +1136,21 @@ open_tunnel() {
             else
                 err "  ssh produced no output at all — it exited without saying why."
                 err "  The log holds the exact command that was run."
+            fi
+            # The launcher's own stderr. This is where "setsid: command not
+            # found" and friends land — the reason a tunnel can fail to
+            # start with nothing at all in its log.
+            if [[ -s "$launcher_err" ]]; then
+                err "  Launcher:"
+                sed 's/^/    /' "$launcher_err" 2>/dev/null | head -5
+            fi
+            # What the tool can actually see right now. If an ssh process
+            # IS carrying this port, the tunnel is up and the status check
+            # is what failed.
+            local seen; seen="$(tunnel_pids "$sport" "$dport" | tr '\n' ' ')"
+            if [[ -n "${seen// /}" ]]; then
+                err "  an ssh process IS carrying port $sport (pid ${seen// /, /, })"
+                err "  — the tunnel is up; the status check failed to see it."
             fi
             # Show what ps sees for this port, so the cause is visible
             # without leaving the tool.
@@ -1346,32 +1469,84 @@ print_banner_body() {
 }
 
 # PIDs holding a listening socket on $1.
-socket_owner_pids() {
-    local port="$1"
-    ss -ltnp 2>/dev/null | awk -v p="$port" '$4 ~ (":" p "$")' \
-      | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
-}
 
-# Whether a listener on $1 exists in the given address family.
+
+# Whether a listener occupies $1 (a port) in the given address family.
 #
 # A WILDCARD listener counts: a socket on 0.0.0.0:P blocks a bind of
 # 127.0.0.1:P, and one on [::]:P blocks [::1]:P. Only the exact address
 # used to be looked for, so a wildcard holder was invisible here — the
 # tool believed the port was free, ssh died on the bind, and the log held
 # nothing but "Address already in use" with no hint as to who held it.
+#
+# The state field 0A in /proc/net/tcp is LISTEN. A v6 wildcard socket is
+# also checked when asking about IPv4: with the default bindv6only=0 it
+# occupies the IPv4 port too, and a bind there would fail.
 family_in_use() {
     local port="$1" family="$2"
-    local -a addrs=()
+    local hexport laddr raddr st rest addr
+    printf -v hexport '%04X' "$port" 2>/dev/null || return 1
     case "$family" in
-        ipv4) addrs=( "127.0.0.1:${port}" "0.0.0.0:${port}" "*:${port}" ) ;;
-        ipv6) addrs=( "[::1]:${port}" "[::]:${port}" "*:${port}" ) ;;
+        ipv4)
+            [[ -r /proc/net/tcp ]] || return 1
+            while read -r _ laddr raddr st rest; do
+                [[ "$st" == "0A" ]] || continue
+                [[ "${laddr##*:}" == "$hexport" ]] || continue
+                addr="${laddr%%:*}"
+                [[ "$addr" == "$_HEX_V4_LOOP" || "$addr" == "$_HEX_V4_ANY" ]] && return 0
+            done < /proc/net/tcp
+            # A v6 wildcard occupies the IPv4 port as well.
+            [[ -r /proc/net/tcp6 ]] || return 1
+            while read -r _ laddr raddr st rest; do
+                [[ "$st" == "0A" ]] || continue
+                [[ "${laddr##*:}" == "$hexport" ]] || continue
+                [[ "${laddr%%:*}" == "$_HEX_V6_ANY" ]] && return 0
+            done < /proc/net/tcp6
+            ;;
+        ipv6)
+            [[ -r /proc/net/tcp6 ]] || return 1
+            while read -r _ laddr raddr st rest; do
+                [[ "$st" == "0A" ]] || continue
+                [[ "${laddr##*:}" == "$hexport" ]] || continue
+                addr="${laddr%%:*}"
+                [[ "$addr" == "$_HEX_V6_LOOP" || "$addr" == "$_HEX_V6_ANY" ]] && return 0
+            done < /proc/net/tcp6
+            ;;
         *) return 1 ;;
     esac
-    local a
-    for a in "${addrs[@]}"; do
-        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qxF "$a" && return 0
-    done
     return 1
+}
+
+# The PID of the process holding a listener on $1, if any.
+# The socket inode in /proc/net/tcp is matched against the socket:[N]
+# symlinks in /proc/PID/fd, which is how the kernel links the two.
+socket_owner_pids() {
+    local port="$1"
+    local hexport sl laddr raddr st txrx trwhen retr uid tmo inode
+    printf -v hexport '%04X' "$port" 2>/dev/null || return 0
+    local -a inodes=()
+    local f
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r "$f" ]] || continue
+        while read -r sl laddr raddr st txrx trwhen retr uid tmo inode; do
+            [[ "$st" == "0A" ]] || continue
+            [[ "${laddr##*:}" == "$hexport" ]] || continue
+            [[ -n "$inode" ]] && inodes+=( "$inode" )
+        done < "$f"
+    done
+    (( ${#inodes[@]} )) || return 0
+    local ino pid fd target
+    for ino in "${inodes[@]}"; do
+        target="socket:[$ino]"
+        for pid in /proc/[0-9]*; do
+            pid="${pid#/proc/}"
+            [[ -d "/proc/$pid/fd" ]] || continue
+            for fd in "/proc/$pid/fd"/*; do
+                [[ -e "$fd" ]] || continue
+                [[ "$(readlink "$fd" 2>/dev/null)" == "$target" ]] && printf '%s\n' "$pid" && break 2
+            done
+        done
+    done
 }
 
 init_state() {

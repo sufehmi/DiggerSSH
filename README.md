@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.3** — a single-file Bash SSH tunnel manager.
+**v1.8.4** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -125,7 +125,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.3  SSH tunnel manager
+   v1.8.4  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -443,6 +443,48 @@ Two more things happen on failure that used not to:
 - **The reason is named.** The old message was "the ssh process wrote
   nothing to its log". Now the log contents are printed, or, if there
   genuinely are none, it says so explicitly and points at the command.
+
+### The kernel is the source of record
+
+The tool used to depend on four external commands that may be absent, or
+may behave differently, on another machine:
+
+| Command | Used for | If it misbehaves |
+|---|---|---|
+| `ps -eo pid=,comm=,args=` | finding tunnels | **every tunnel looks stopped** |
+| `ss -ltn` | checking whether a port is busy | **every port looks free** |
+| `awk` | timestamping the log | the filter dies, the log stays empty |
+| `setsid` | detaching the tunnel | **the tunnel never starts** |
+
+Every one of those failures was silent. A `ps` that does not understand
+the format returns nothing, so no tunnel was ever found; a missing `ss`
+means every port looks free, so `ssh` dies on the bind; a missing `setsid`
+means the launcher never runs — and its error message went to
+`/dev/null`, so the log held nothing but the command line and the tool
+reported "Tunnel did not come up" with no reason at all.
+
+So the kernel's own view under `/proc` is the source of record:
+
+- **Processes** come from `/proc/<pid>/comm` and `/proc/<pid>/cmdline`.
+- **Listeners** come from `/proc/net/tcp` and `/proc/net/tcp6`, where the
+  state field `0A` means LISTEN and the address is hex, each 32-bit word
+  little-endian (`127.0.0.1` reads as `0100007F`).
+
+Neither needs an external command at all, so the tool behaves the same on
+a full system and on a bare container.
+
+`ps auxw | grep <port>` is still what you run by hand, and the tool's
+answer still comes from the same `/proc` data, so the two cannot disagree.
+
+### The tunnel is verified, not assumed
+
+For a local forward the ground truth is the **bound socket** — an `ssh`
+process can be alive and still have failed to bind, and only the listener
+proves the tunnel forwards. The tool waits for that socket rather than
+for the process, because `ssh` binds *after* it connects.
+
+A remote forward cannot be checked this way — its listener is on the
+server — so there the live `ssh` process is the evidence.
 
 ---
 
