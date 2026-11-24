@@ -1028,7 +1028,24 @@ open_tunnel() {
         printf '%s\n' "printf '[%s] transport exited with status %s\\n' \"\$(date '+%Y-%m-%d %H:%M:%S')\" \"\${PIPESTATUS[0]}\""
     } > "$runner"
     chmod 700 "$runner" 2>/dev/null || true
-    if command -v setsid >/dev/null 2>&1; then
+    # Launch the runner in its OWN systemd scope when systemd is available.
+    #
+    # Why: a tunnel started from inside another systemd service (the Hermes
+    # gateway, for one) inherits that service's cgroup. When that service
+    # stops, its ExecStopPost reaps every PID left in the cgroup
+    # (gateway/cgroup_cleanup.py SIGKILLs them) — and the tunnel dies with
+    # it, silently: the log shows only the start line, no "transport
+    # exited". A dedicated scope puts the transport outside every other
+    # service's cgroup, so it survives those restarts.
+    #
+    # systemd-run --scope keeps the runner attached to the scope unit, so
+    # `systemctl --user stop diggerssh-<slug>.scope` stops the tunnel too.
+    # setsid/nohup remain the fallback for hosts without systemd.
+    local scope_unit="diggerssh-$slug.scope"
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        systemd-run --user --scope --unit="$scope_unit" --quiet \
+            bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
+    elif command -v setsid >/dev/null 2>&1; then
         setsid bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
     elif command -v nohup >/dev/null 2>&1; then
         nohup bash "$runner" >> "$tlog" 2>> "$launcher_err" < /dev/null &
