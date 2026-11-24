@@ -9,7 +9,7 @@
         /____//____/
 ```
 
-**v1.8.5** — a single-file Bash SSH tunnel manager.
+**v1.8.6** — a single-file Bash SSH tunnel manager.
 
 DiggerSSH manages SSH port-forwarding tunnels. It keeps a local registry of
 the tunnels you configure, lets you create new ones and re-open existing
@@ -36,6 +36,9 @@ holding the port.
   - [Diagnosing a tunnel that did not come up](#diagnosing-a-tunnel-that-did-not-come-up)
 - [Key exchange fallback](#key-exchange-fallback)
 - [autossh](#autossh)
+  - [The transport never gives up](#the-transport-never-gives-up)
+- [Tunnels and systemd scopes](#tunnels-and-systemd-scopes)
+  - [Telling the two apart](#telling-the-two-apart)
 - [Post-quantum (ML-DSA-65) support](#post-quantum-ml-dsa-65-support)
   - [A note on key types](#a-note-on-key-types)
 - [Files & layout](#files--layout)
@@ -73,9 +76,15 @@ holding the port.
   offered as editable defaults next time.
 - **Survives dropped connections** — uses [autossh](http://www.haproxy.org/download/1.8/doc/autossh.txt)
   when it is installed so the tunnel re-establishes itself after a network
-  drop; falls back to plain `ssh` when it is not.
-- **No dependencies** — pure Bash 4+ plus `ssh`. `autossh` is optional and
-  only improves reliability.
+  drop; falls back to plain `ssh` when it is not. The transport is told
+  never to give up, so a tunnel that loses its link comes back on its own
+  instead of staying dead until someone notices (see
+  [autossh](#autossh)).
+- **Survives service restarts** — each tunnel runs in its own systemd scope,
+  so it is not killed when some other service on the machine restarts and
+  reaps its cgroup (see [Tunnels and systemd scopes](#tunnels-and-systemd-scopes)).
+- **No dependencies** — pure Bash 4+ plus `ssh`. `autossh` and a user
+  `systemd` are optional and only improve reliability.
 
 ---
 
@@ -86,6 +95,7 @@ holding the port.
 | Bash | 4.0 or newer (uses arrays, `[[ ]]`, `read -r`) |
 | `ssh` | OpenSSH client |
 | `autossh` | Optional — auto-restarts the tunnel if the link drops |
+| `systemd` (user) | Optional — each tunnel gets its own scope, so other services cannot reap it |
 | `ss` | Optional — used for per-family port checks |
 
 Tested on **Debian 13 (trixie)** with **OpenSSH 10.0p2**.
@@ -125,7 +135,7 @@ diggerssh
  / / / / / __ `/ __ `/ _ \/ ___/\__ \\__ \/ /_/ /
 /_____/_/\__, /\__, /\___/_/   /____/____/_/ /_/
         /____//____/
-   v1.8.5  SSH tunnel manager
+   v1.8.6  SSH tunnel manager
 
   1) Create Tunnel to Server
   2) Connect Tunnel (to a server's Port)
@@ -404,6 +414,13 @@ Every entry written to a log file carries a timestamp:
 The tunnel's own log is the `ssh` process's output, timestamped as it is
 written. The activity log records what the tool did.
 
+**A log with only the start line and no `transport exited` line means the
+transport was killed from outside** — it did not stop on its own. Two
+causes account for almost all of it: the `autossh` grace period expiring
+(see [The transport never gives up](#the-transport-never-gives-up)) and
+another service reaping the cgroup the tunnel was riding (see
+[Tunnels and systemd scopes](#tunnels-and-systemd-scopes)).
+
 The argument is **parsed, not compared as text**. `ssh` accepts many
 spellings of the same forward, and the destination may be any host:port:
 
@@ -572,6 +589,87 @@ autossh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=5 \
 
 Without `autossh`, plain `ssh` is used and the tunnel does not survive a
 network drop.
+
+### The transport never gives up
+
+`autossh` has two timeouts that decide when it stops trying:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AUTOSSH_GATETIME` | `30` | Give up if the first reconnect attempts all fail within this many seconds |
+| `AUTOSSH_MAX_FAILURES` | `0` | Give up after this many consecutive failures (`0` = never) |
+
+The default `GATETIME=30` is a trap: when the link flickers, `autossh`
+exits, and the tunnel stays dead **permanently and silently**. The log
+shows the start line and nothing else — no "transport exited" line, because
+the transport was not the one that stopped.
+
+DiggerSSH therefore exports both variables in the launcher it generates:
+
+```bash
+export AUTOSSH_GATETIME=0
+export AUTOSSH_MAX_FAILURES=0
+```
+
+`GATETIME=0` means "no grace period" — `autossh` keeps retrying for as long
+as it takes, and the tunnel comes back by itself.
+
+---
+
+## Tunnels and systemd scopes
+
+A tunnel started from inside another systemd service inherits **that
+service's cgroup**. When the service stops, its `ExecStopPost=` may reap
+every PID left in the cgroup — and the tunnel dies with it, silently, the
+same way the `autossh` timeout kills it: the log shows the start line and
+no "transport exited" line.
+
+This is not hypothetical. The Hermes gateway's unit runs
+
+```
+ExecStopPost=-… hermes --run-module gateway.cgroup_cleanup
+```
+
+which SIGKILLs every remaining PID in the gateway's cgroup. A tunnel
+launched from inside an agent session therefore dies on every gateway
+restart — and looks exactly like a network problem.
+
+DiggerSSH launches each tunnel in its **own systemd scope** instead:
+
+```bash
+systemd-run --user --scope --unit=diggerssh-<slug>.scope \
+  bash ~/.diggerssh/tunnels/<slug>.launch.sh
+```
+
+The scope is a unit of its own, outside every other service's cgroup, so
+nothing else can reap the tunnel. It also gives you a clean way to stop it:
+
+```bash
+systemctl --user stop diggerssh-<slug>.scope
+```
+
+On a host without systemd, `setsid`/`nohup` are used as before.
+
+### Telling the two apart
+
+Both failures look the same in the log — a start line and nothing else.
+To tell them apart, look at the process's cgroup:
+
+```bash
+cat /proc/$(pgrep -f 'R <port>:127.0.0.1:<dest>' | head -1)/cgroup
+```
+
+- ends in the scope's own name (`diggerssh-<slug>.scope`) → the tunnel is
+  isolated and safe
+- ends in **another service's** name (e.g. `…-gateway.service`) → the
+  tunnel is riding that service's cgroup and will be reaped with it —
+  re-open the tunnel so it gets its own scope
+
+To confirm the scope unit is alive:
+
+```bash
+systemctl --user list-units 'diggerssh-*'
+```
 
 ---
 
