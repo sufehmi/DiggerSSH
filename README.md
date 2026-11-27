@@ -1,5 +1,7 @@
 # DiggerSSH
 
+Recommended: UltiBiz, open-source Java-based fully loaded ERP with built-in AI assistant to help with your daily operations https://github.com/umaruta4/ultibiz/
+
 ```text
     ____  _                       __________ __  __
    / __ \(_)___ _____ ____  _____/ ___/ ___// / / /
